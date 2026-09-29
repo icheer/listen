@@ -526,7 +526,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       },
       methods: {
         // ---------- 字号 ----------
-        decFont() { if (this.fontSize > 0) this.setFontSize(this.fontSize - 1); },
+        decFont() { if (this.fontSize > -1) this.setFontSize(this.fontSize - 1); },
         incFont() { if (this.fontSize < 9) this.setFontSize(this.fontSize + 1); },
         setFontSize(n) {
           this.fontSize = n;
