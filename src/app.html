@@ -79,7 +79,7 @@
     <!-- 主界面 -->
     <template v-else>
       <header class="app-header">
-        <button class="icon-btn" aria-label="菜单" @click="menuOpen = !menuOpen">⚙</button>
+        <button class="icon-btn" data-menu-toggle aria-label="菜单" @click="menuOpen = !menuOpen">⚙</button>
         <div class="header-title">
           <h1 class="app-title">听见</h1>
           <p class="app-sub">{{ statusText }}</p>
@@ -324,6 +324,15 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         this._applyTheme(this._resolveTheme());
         this._restoreDraft(); // 恢复上次草稿（沿用旧版「刷新不丢字」体验，PLAN.md §4.6）
         draftTimer = setInterval(() => this._saveDraft(), 30000);
+        // click outside 关菜单：点菜单和 ⚙ 本身以外的任何区域都收起（⚙ 由自身 @click 切换，这里跳过）
+        if (document.addEventListener) {
+          document.addEventListener('click', (e) => {
+            if (!this.menuOpen) return;
+            const t = e.target;
+            if (t && t.closest && t.closest('.menu, [data-menu-toggle]')) return;
+            this.menuOpen = false;
+          });
+        }
         // 跟随系统：未手动设置时，系统切换即时生效
         if (window.matchMedia) {
           try {
