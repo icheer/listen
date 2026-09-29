@@ -12,8 +12,8 @@ const noMinify = process.argv.includes('--no-minify');
 
 // vendor 脚本在压缩阶段的占位文本（普通文本节点，压缩后原样保留），随后替换回脚本原文。
 // 不能直接内联后再压缩——html-minifier 的 minifyJS 会把 vendor 也 terser 一遍（约定：不压 vendor）。
-const VENDOR_PLACEHOLDER = '%%VUE_VENDOR%%';
-const VENDOR_TAG_RE = /<script\s+src="vendor\/vue\.global\.prod\.js"><\/script>/;
+// v1.1 起泛化：app.html 里所有 <script src="vendor/xxx.js"></script> 都走同一占位符机制（Vue、qrcode-generator）。
+const VENDOR_TAG_RE = /<script\s+src="(vendor\/[^"]+)"><\/script>/g;
 
 console.log('🚀 开始部署...');
 
@@ -57,21 +57,28 @@ try {
     throw new Error('未找到 style.css 链接（app.html 必须引用它）');
   }
 
-  // 1.6. vendor Vue：<script src> 标签 → 占位文本（压缩后换回脚本原文）
-  console.log('📦 处理 vendor Vue 内联...');
-  const vendorPath = path.join(__dirname, 'vendor', 'vue.global.prod.js');
-  if (!VENDOR_TAG_RE.test(processedHtml)) {
+  // 1.6 vendor 脚本（Vue / qrcode-generator / …）：<script src> 标签 → 占位文本（压缩后换回脚本原文）
+  console.log('📦 处理 vendor 脚本内联...');
+  const vendorFiles = new Map(); // src 路径 → 脚本原文
+  processedHtml = processedHtml.replace(VENDOR_TAG_RE, (full, src) => {
+    const vendorPath = path.join(__dirname, src);
+    if (!fs.existsSync(vendorPath)) {
+      throw new Error(`vendor 文件不存在: ${vendorPath}`);
+    }
+    const content = fs.readFileSync(vendorPath, 'utf-8');
+    if (content.length < 1000) {
+      throw new Error(`vendor 文件可疑（仅 ${content.length} 字符）: ${src}`);
+    }
+    if (src.endsWith('vue.global.prod.js') && content.length < 100000) {
+      throw new Error(`vendor Vue 文件可疑（仅 ${content.length} 字符，约 16 万才是正常副本）`);
+    }
+    vendorFiles.set(src, content);
+    console.log(`✅ vendor 读取: ${src}（${content.length} 字符）`);
+    return `%%VENDOR:${src}%%`;
+  });
+  if (!vendorFiles.has('vendor/vue.global.prod.js')) {
     throw new Error('未找到 vendor Vue 脚本标签（app.html 必须在应用脚本前引用它）');
   }
-  if (!fs.existsSync(vendorPath)) {
-    throw new Error('src/vendor/vue.global.prod.js 不存在（见 CHECKLIST Phase 0 下载步骤）');
-  }
-  const vendorContent = fs.readFileSync(vendorPath, 'utf-8');
-  if (vendorContent.length < 100000) {
-    throw new Error(`vendor Vue 文件可疑（仅 ${vendorContent.length} 字符，约 16 万才是正常副本）`);
-  }
-  processedHtml = processedHtml.replace(VENDOR_TAG_RE, VENDOR_PLACEHOLDER);
-  console.log(`✅ vendor Vue 读取成功（${vendorContent.length} 字符），压缩阶段用占位文本` );
 
   // 1.7. 压缩：HTML 空白/注释 + 内联 CSS + 应用 <script>；vendor 尚未内联，不受影响
   if (!noMinify) {
@@ -93,16 +100,19 @@ try {
   }
 
   // 1.8. 占位文本 → vendor 脚本原文（独立 <script> 块，data-src 标记来源）
-  if (!processedHtml.includes(VENDOR_PLACEHOLDER)) {
-    throw new Error('压缩后占位文本丢失（html-minifier 不应动普通文本节点）');
+  for (const [src, content] of vendorFiles) {
+    const ph = `%%VENDOR:${src}%%`;
+    if (!processedHtml.includes(ph)) {
+      throw new Error(`压缩后占位文本丢失: ${ph}（html-minifier 不应动普通文本节点）`);
+    }
+    // ⚠️ 必须用函数形式替换：字符串替换形式会把 vendor 源码里的 $&、$$ 等当特殊模式解释，
+    //    Vue 源码含上千个 $，会静默损坏脚本（曾在 Phase 0 调试中真实踩坑）。
+    processedHtml = processedHtml.replace(
+      ph,
+      () => `<script data-src="${src}">\n${content}\n</script>`
+    );
+    console.log(`✅ vendor 已内联为独立脚本块（未压缩）: ${src}`);
   }
-  // ⚠️ 必须用函数形式替换：字符串替换形式会把 vendor 源码里的 $&、$$ 等当特殊模式解释，
-  //    Vue 源码含上千个 $，会静默损坏脚本（曾在 Phase 0 调试中真实踩坑）。
-  processedHtml = processedHtml.replace(
-    VENDOR_PLACEHOLDER,
-    () => `<script data-src="vendor/vue.global.prod.js">\n${vendorContent}\n</script>`
-  );
-  console.log('✅ vendor Vue 已内联为独立脚本块（未压缩）');
 
   // 2. 读取 worker.js 文件
   const workerPath = path.join(__dirname, '..', 'worker.js');

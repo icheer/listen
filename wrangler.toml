@@ -2,11 +2,22 @@ name = "listen"
 main = "worker.js"
 compatibility_date = "2024-09-01"
 
+# 远程字聊：每房间一个 Durable Object（PLAN.md §11）
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom"]
+
 # 敏感变量不要写在这里，用 wrangler secret put 或 Dashboard 配置：
-#   ACCESS_PASSWORD    进入口令（改密码 = 吊销全部已发 ticket）
+#   ACCESS_PASSWORD    进入口令（改密码 = 吊销全部已发 ticket 与房间 token）
 #   VOLC_APP_ID        火山引擎 APP ID（API_KEY.txt）
 #   VOLC_ACCESS_TOKEN  火山引擎 Access Token（API_KEY.txt）
 # 可选（有默认值）：
 #   VOLC_RESOURCE_ID     默认 volc.bigasr.sauc.duration
 #   VOLC_ENDPOINT        默认 https://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 #   MAX_SESSION_MINUTES  默认 120（计费护栏：单条 /ws 连接时长上限）
+#   JOIN_WINDOW_SECONDS  默认 600（邀请码加入窗口）
+#   ROOM_TTL_MINUTES     默认 120（房间硬顶；测试可用 ROOM_TTL_SECONDS 秒级覆盖）

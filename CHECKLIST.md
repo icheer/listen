@@ -153,3 +153,63 @@ curl -s https://<域名>/manifest.webmanifest | head -3      # JSON 正常
 curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<域名>/api/auth -H 'Content-Type: application/json' -d '{"password":"错误"}'   # 401
 # 真机：完整走一遍 开始→对话→停止→历史可见→复制；添加到主屏幕后图标/全屏正常
 ```
+
+---
+
+# v1.1 · 远程字聊（设计：PLAN.md §11；2026-09-29 拍板：DO / 气泡 / 两人 / 「对方」）
+
+## Phase 7 · Durable Object 房间与后端
+
+- [x] `wrangler.toml`：`[durable_objects.bindings]`（name ROOM / class ChatRoom）+ `[[migrations]] tag="v1" new_sqlite_classes=["ChatRoom"]`（PLAN.md §11.6）；`worker.js` 改为同时导出 `ChatRoom` 类与默认 fetch（导出形状 `{ default: {fetch}, ChatRoom }`，注入标记区间不受影响）
+- [x] room token 签发/校验：`{scope:'room', room, role, jti, exp}`，HMAC 域字符串 `listen-room-v1`（key = `SHA256(ACCESS_PASSWORD + 域)`，改密码连坐吊销）；复用现有 b64url/HMAC 工具函数；`verifyTicket` 扩展为双格式（app 票据 | room token），`/ws` 两者都收且 room token 同样进 `ticketConns` 并发槽
+- [x] `POST /api/room`（body `{ticket}`，须为 app 票据）：生成 6 位 code（字母表去 0/O/1/I，crypto 随机）→ `idFromName(code)` 调 DO 初始化（`joinDeadline = now + JOIN_WINDOW_SECONDS(默认600)`、`hardEnd = now + ROOM_TTL_MINUTES(默认120)*60s`、`consumed=false`）→ 返回 `{code, token(host room token), joinUrl, joinDeadline, hardEnd}`
+- [x] `POST /api/join`（body `{code}`，per-IP 20 次/分钟限流，内存 Map）：DO `claimJoin` → 房间存在且未关闭未烧毁且在加入窗口内 → 烧毁 code + 签发 guest room token（exp=hardEnd）→ `{token, hardEnd}`；否则 404 人话文案（「邀请码不存在或已过期」/「邀请码已被使用」）
+- [x] `GET /j/:code`：返回同一份注入 HTML（前端按路径 `/j/<code>` 进访客模式；code 大小写归一）
+- [x] `GET /room/:code?token=`：Worker 校验签名/exp/`room` 与路径一致 → `stub.fetch` 转发（role 经内部 header 传递，DO 信任 Worker 附加头）
+- [x] `ChatRoom` DO：`/init`（POST，Worker 内部）与 `/claim`（POST，返回 {ok, hardEnd} 或失败原因）；`/ws` 升级 → 成员表（role→ws；同 role 重连先 close 旧连接 4000 "replaced"）→ 发 `welcome {role, peerOnline, backlog}`；消息处理：`line.final` → seq++ + 存 storage（上限 200 条）+ 转发对端（对端离线时照存）；`line.interim` → 仅对端在线时转发；`ping`→`pong`；`bye`→close(1000)；断开 → 清成员表 + 对端 `presence offline`；`alarm()`（init 时 `setAlarm(hardEnd)`）→ 双端 `room_closed` + `storage.deleteAll()`
+- [x] 新建 `test/room-e2e.mjs`（真实 wrangler dev，`ws` 包双客户端）：建房→加入→双向 line 交换（host→guest、guest→host，seq 单调）；interim 即时转发；一次性 join（第二次 /api/join 404）；过期 code 拒绝；成员顶替（同 role 二连，旧连接 4000）；断开重连 backlog 补发；ping/pong；`room_closed`（对 `:8788` 第二实例 `--var JOIN_WINDOW_SECONDS:3 --var ROOM_TTL_MINUTES:1` 验证短 TTL 生命周期）
+
+**验收**：
+```bash
+npx wrangler dev &                    # :8787 主实例（.dev.vars 照旧）
+node test/room-e2e.mjs                # 全部场景 PASS（含自动起/收 :8788 短 TTL 实例）
+# 回归：node test/core-test.mjs && node test/app-e2e.mjs   # /ws 双格式改造不破坏现有链路
+```
+
+## Phase 8 · 前端字聊界面（气泡 + 邀请 + 访客）
+
+- [x] vendor `qrcode-generator`（MIT）到 `src/vendor/qrcode.min.js`（约 15KB）；`src/deploy.js` 泛化 vendor 内联：循环替换**所有** `vendor/*.js` script 标签为占位符、压缩后按原样换回（机制与 Vue 相同，**替换一律函数形式**）
+- [x] `src/style.css`：`.chat` 滚动区、`.bubble.me`（右，brand 底白字）/`.bubble.them`（左，surface 底+边框 + 上方小字「对方」）/`.bubble.ghost`（半透明）、居中系统消息（复用 session-divider）、邀请屏与访客落地屏样式；气泡 max-width 85%，字号沿用 `.font-0…9`
+- [x] 引擎双消费者抽象：ASR definite/interim 输出可挂「单机渲染（finalLines）」或「字聊渲染（chatLines + 发房间）」两套消费者；进入字聊时若正在单机收音 → 先弹确认模态框停止
+- [x] 房间 WS 客户端（模块级变量，同 ASR 引擎风格）：连接 `/room/<code>?token=`、退避重连 1/2/4/8s、`welcome` backlog 整体重建 chatLines、`line`/`presence`/`room_closed` 分发、每 25s `ping` + 60s 无消息看门狗；心跳/重连不触碰音频管线
+- [x] 主机邀请屏：⚙ 菜单新增「远程字聊」→ `POST /api/room` → QR（canvas→`toDataURL`→`<img>`，微信长按识别只认 img）+ 6 位码大字 + 倒计时 + 「等待对方加入…」；窗口过期 → 「重新生成」；对方加入（presence）→ 双端自动切聊天屏
+- [x] 聊天屏（双端同构）：气泡区（我右/对方左+「对方」标签/ghost 半透明/居中系统消息）+ 底部主麦克风按钮三态复用 + 「结束」(host)/「退出」(guest)（自绘确认模态框复用）+ A-/A+、自动滚动/回到最新、wakeLock 全部复用
+- [x] 访客路径：`location.pathname` 匹配 `/j/<code>` → 落地屏（「加入字聊」大按钮；过期/已用人话文案 + 「请对方重新发起」）→ `POST /api/join` → 聊天屏；无密码门/无历史/无 ⚙（保留 A-/A+ 与系统主题）；麦克风拒绝 → **只读模式**（toast 提示一次，界面不挡）
+- [x] 字聊历史（host 侧）：60s + pagehide upsert `listen_sessions`（行前缀 `我：`/`对方：`）；字聊期间不写 `listen_draft`、不显示草稿横幅；挂断/到期/退回 → 结束会话落库
+- [x] 测试扩展：`test/app-e2e.mjs` 加字聊场景（真实 `/api/room` + `/api/join` + `/room` WS 经 wrangler dev；host 喂真实音频出真字，guest 侧用房间协议注入模拟行；断言 chatLines 双侧/ghost 替换/重连补发/挂断落库）；`test/ui-browser-test.mjs` 加渲染用例（邀请屏 QR `<img>` 存在 + 倒计时、聊天屏气泡左右/名字/ghost、访客落地屏、只读降级）
+
+**验收**：
+```bash
+node src/deploy.js && node test/core-test.mjs && node test/app-e2e.mjs && node test/ui-browser-test.mjs
+# 手测（真机×2，或一机 + 无痕窗口）：
+# 1. 主机生成邀请 → 另一设备扫码/输码 → 双端自动进聊天屏（「对方已加入」）
+# 2. 两端同时说话 → 双 ghost 并存、各自定稿成实气泡、左右与名字正确
+# 3. 访客飞行模式 10s 恢复 → 定稿不丢（backlog 补发），系统消息「连接已恢复」
+# 4. host 结束 / guest 退出 → 双端正确退回；host 历史出现「我：/对方：」全文
+```
+
+## Phase 9 · 双端联调与收尾（v1.1）
+
+- [ ] 真机双端全流程联调：微信「扫一扫」直接扫码 + 微信内**截图二维码长按识别**两条进入路径（`<img>` 渲染）；iOS Safari + Android Chrome 各一
+- [ ] 同时说话 2 分钟稳定性：双端各自 ASR 会话互不影响、房间心跳不断、无消息丢失
+- [ ] 边界路径走查：2h 上限提示、host 结束、guest 退出、邀请过期「重新生成」、访客只读模式、host 断网重连
+- [x] `README.md` 补远程字聊章节（使用流程 / 场景边界「适合异地家人」/ 费用提示：双端各一条 ASR 流）；`CLAUDE.md` 架构速查补 DO 房间/room token/消息协议 + 进度同步
+- [x] 注入体积复查：单文件 HTML 增量 ~15KB（QR vendor）+ 聊天 UI；确认 `max-age=300` 缓存策略仍适用
+
+**验收**（真机双端）：
+```
+□ 微信截图二维码 → 长按识别 → 打开链接 → 「加入字聊」成功进入
+□ 孙女端正常说话 → 爷爷端大字号气泡 <1.5s 看到草稿在长；反向同理
+□ 断网恢复 / 锁屏回来 → 不丢定稿、自动恢复、出现「连接已恢复」系统消息
+□ host 结束字聊 → 双端退出；主机历史里完整对话（我：/对方：前缀）可复制
+```

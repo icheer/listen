@@ -1,14 +1,16 @@
-# 听见（listen）— 项目规划 v1
+# 听见（listen）— 项目规划 v1.1
 
 > 给听障人士的移动端优先实时语音转写 Web 应用：说话人对着手机说话，屏幕上实时出字。
 > 语音引擎：火山引擎「豆包流式语音识别大模型」（v3 协议，双向流式 WebSocket）。
 > 部署：单个 Cloudflare Worker（同构参考 `../jev-decides`）。
 > 实施步骤见 `CHECKLIST.md`。协议实测细节见 §4 与附录 A。
+> v1.1 增补：**远程字聊**（双机气泡聊天室，§11；2026-09-29 拍板：上 Durable Object / 微信式气泡 / 两人封顶 / 对方固定显示「对方」）。
 
 ## 0. 产品定位与形态
 
 - **目标用户**：听障人士 + 老年听障用户（低视力友好是硬需求）；使用场景是面对面沟通——家人、就医、办事窗口。
 - **一句话**：打开网页 → 输入密码 → 点一个大按钮 → 屏幕实时显示对方说的话。
+- **双模式（v1.1 起）**：① 面对面单机转写（主形态，如上）；② **远程字聊**——主机生成一次性邀请码/二维码，异地家人免密码加入文字聊天室，双方各持一机、各自转写、气泡分侧显示（设计与边界见 §11）。
 - **核心体验指标**（按重要性排序）：
   1. **首字延迟**（说完一句话到第一个字出现）：目标 < 1.5s，常态 0.6–1.2s
   2. **跟字流畅度**：后续文字随语音连续上屏，无卡顿感
@@ -160,7 +162,11 @@ GET  /                      → 单文件前端（deploy.js 注入，Cache-Contr
 GET  /favicon.svg           → 内联 SVG 图标
 GET  /manifest.webmanifest  → PWA manifest（Phase 6）
 POST /api/auth              → 鉴权换票
-GET  /ws?ticket=<ticket>    → WebSocket 升级 → 代理到火山引擎
+POST /api/room              → 建字聊房间（凭 host ticket）→ {code, token, joinUrl, …}（§11）
+POST /api/join              → 访客用一次性 code 换 room token（§11）
+GET  /j/:code               → 访客落地页（同一份前端，按路径进访客模式）（§11）
+GET  /room/:code?token=     → 房间 WebSocket → ChatRoom DO 文本中继（§11）
+GET  /ws?ticket=<ticket>    → WebSocket 升级 → 代理到火山引擎（v1.1 起也接受 room token，§11）
 ```
 
 ### 3.1 `POST /api/auth`
@@ -319,6 +325,7 @@ onResponse(utterances):
 3. `/api/auth` per-IP 防爆破（内存尽力而为）；`/ws` 并发上限 per ticket 2 条（内存 Map，尽力而为）。
 4. 会话时长上限（默认 120 分钟）= 计费护栏（火山按时长计费）。
 5. 明确不做（v1 取舍）：KV 全局限频、票据撤销列表——单人/小家庭场景收益低，复杂度高。后续要开放给更大群体再加。
+6. 远程字聊的访客面（v1.1，§11.2）：一次性邀请码（10 分钟加入窗口）+ 房间 2h 硬顶 + 成员 2 封顶；访客 token 仅限房间与 ASR、拿不到密码级权限；改密码连坐吊销房间 token。
 
 ## 7. 性能预算（首字延迟分解）
 
@@ -372,6 +379,100 @@ node src/deploy.js && npx wrangler deploy
 | 4 | 转写主界面 | 真机中文连续对话 5 分钟不断流 |
 | 5 | 适老化与稳定性 | 锁屏常亮/断网恢复/字号十档手测 |
 | 6 | 历史 + PWA + 收尾 | 线上全流程回归 + README/CLAUDE.md |
+| 7 | Durable Object 房间与后端（v1.1） | room-e2e 双客户端全场景（中继/一次性/过期/补发） |
+| 8 | 前端字聊界面（气泡/邀请/访客） | app-e2e + ui-browser 扩展；真机双人冒烟 |
+| 9 | 双端联调与收尾（v1.1） | 真机双端全流程（微信两种进入方式） |
+
+---
+
+## 11. 远程字聊（chat 模式，v1.1）
+
+### 11.0 定位与场景边界
+
+- **形态**：不是「打电话」，是**实时双向字聊房间**——两端各有麦克风 + 屏幕，各自跑一条 ASR 流，文字经房间中继互达。无通话压力、可回看、可导出；WiFi-only 无 SIM 设备可用；跨境零漫游。
+- **目标场景**：异地家人——听障老人 ↔ 听力正常孙辈（典型：爷爷 ↔ 7 岁孙女）。
+- **边界（明示不做）**：**不支持同房间两人各持一机**——两个麦克风互相串音，同一句话会被两条 ASR 流各转一遍。面对面继续用单机模式；邀请页明示「适合异地家人」。
+- **架构红利**：线上**只传文字不传音频**——无回声、无 AEC、无音频带宽问题；每端麦克风只听面前的人。
+
+### 11.1 架构：ASR 链路零改动 + 第二条纯文本 WS
+
+```
+主机（密码登入，菜单「远程字聊」）                访客（/j/邀请码，免密码）
+  麦克风→16k PCM→ /ws ──代理──▶ 火山 ASR          麦克风→16k PCM→ /ws（凭 room token）
+        │ 定稿/草稿                                    │ 定稿/草稿
+        ▼                                              ▼
+  本地气泡渲染 ──JSON──▶ /room/<code> ◀─ Durable Object「ChatRoom」 ─▶ 转发 ─▶ 对方气泡渲染
+```
+
+- 每端一条**现有** `/ws`（协议帧/并发槽/会话上限全复用；访客改用 room token 鉴权，见 §11.2）。
+- 房间 = 每 code 一个 DO（`env.ROOM.idFromName(code)`），只中继 JSON 文本帧，**不碰音频字节**——已验证的识别管线与新增中继完全解耦。
+- **为什么必须 DO**：异地两端落在不同 POP 的不同 isolate，模块级内存 Map 无法共享；`wrangler dev` 单实例会让内存方案「本地全绿、线上必坏」——这是本增补最大的隐性坑，已在架构上规避。
+
+### 11.2 生命周期与安全参数
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| 邀请码 code | 6 字符，字母表去掉 0/O/1/I（32⁶ ≈ 10⁹） | crypto 随机；可扫码也可手输（老人友好） |
+| 加入窗口 | 建房起 10 分钟（env `JOIN_WINDOW_SECONDS` 默认 600） | 过期 → 访客落地页「邀请已过期，请对方重新发起」 |
+| 一次性 | 首位访客成功换取 token 即烧毁 code | 截图外泄也失效；访客退出后不能换人，需重开新房 |
+| 房间硬顶 | 建房起 2 小时（env `ROOM_TTL_MINUTES` 默认 120），DO `alarm()` 到点关闭并清存储 | 访客 ASR 费用上界 |
+| 成员 | 2 封顶（host + guest 各一 slot；**同 role 重连顶替旧连接**，close 4000 replaced） | v1 决策 |
+| room token | `{scope:'room', room, role, jti, exp: hardEnd}`，双段式同 app 票据 | host 建房即发；guest 在 `/api/join` 换取；有效期内可重复用于重连 |
+| token 密钥 | `SHA256(ACCESS_PASSWORD + "listen-room-v1")`（与 app 票据不同域字符串） | **改密码连坐吊销全部房间**（顺带收益，零额外代码） |
+| 访客权限 | 仅 `/room/<code>` 与 `/ws`（ASR，同样受并发槽/会话上限约束）；无密码、无历史、无主界面、无 ⚙ | 最坏损失 = 2h ASR 时长 |
+| 断线重连 | token 有效期内可重连；DO 保留最近 200 条定稿，重连 `welcome` 全量补发 | 定稿不丢；interim 丢即丢 |
+| `/api/join` 限流 | per-IP 20 次/分钟（内存尽力而为） | 防 code 爆破（熵 30 bit 之外的保险） |
+
+### 11.3 房间消息协议（JSON 文本帧）
+
+| 方向 | 消息 | 说明 |
+| --- | --- | --- |
+| C→S | `{"t":"line","kind":"final"\|"interim","key","text"}` | 只发**自己的** ASR 结果；final 由 DO 记账（seq++ / 存储 / 转发），interim 转发即弃（不存不排序） |
+| C→S | `{"t":"bye"}` / `{"t":"ping"}` | 主动离开 / 客户端每 25s 心跳（静默期防空闲断连），DO 回 `pong` |
+| S→C | `{"t":"welcome","role","peerOnline","backlog":[…]}` | 建连即回；backlog = 全部已存定稿（权威序），客户端**整体重建**气泡列表 |
+| S→C | `{"t":"line","from":"host"\|"guest","kind","key","text","seq"}` | 接收端 `from` ≠ 自己 → 对方侧气泡；seq 为 DO 单调计数（信息性，留作未来排序需要） |
+| S→C | `{"t":"presence","online":bool}` | 对方加入/离开（「对方已加入」「对方已离开」系统消息） |
+| S→C | `{"t":"room_closed","reason"}` / `{"t":"pong"}` / `{"t":"error","msg"}` | 房间到期或主机结束 / 心跳回应 / 错误人话文案 |
+
+**渲染规则（双端对称 = §4.3 算法 × 两侧）**：definite 追加实气泡；interim 显示为该侧**半透明 ghost 气泡**，同侧新 final 到达即清空该侧 ghost（ghost 替换不依赖 key 相等——definite 的 key 与 interim 的不保证一致）；双方 ghost 并存互不干扰（同聊天应用「正在输入」位，天然容纳同时说话）。排序按到达序；罕见双端顺序不一致在聊天语义下无害。
+
+### 11.4 前端设计（气泡 + 三屏）
+
+- **气泡布局（三重编码，无障碍）**：对齐为主（我右 / 对方左）、颜色为辅（我 = brand 底白字；对方 = surface 底 + 边框）、名字标签兜底（对方气泡上方小字「对方」——颜色不作唯一区分，老年男性色盲率 ~8%）。vh 十档字号沿用；气泡 max-width 85%，大字号只增高不破版。居中系统消息（「对方已加入」「连接已恢复」）复用 session-divider 样式。
+- **三屏**：① 主机**邀请屏**——QR 大图 + 6 位码大字 + 倒计时 + 「等待对方加入…」；过期 → 「重新生成」；② **聊天屏**（双端同构）——滚动气泡区 + 底部主麦克风按钮（三态文案复用）+ 「结束」(host) /「退出」(guest)（自绘确认模态框复用）+ A-/A+ 与自动滚动/回到最新复用；③ 访客**落地屏**（`/j/<code>` → 「加入字聊」大按钮 → `/api/join`）。
+- **访客端极简**：无密码门、无历史、无 ⚙；保留 A-/A+ 与系统主题跟随；**麦克风拒绝 → 只读模式**（仍可看对方气泡，界面不挡）。
+- **QR**：vendored `qrcode-generator`（MIT，~15KB，构建期内联——deploy.js 的第二个 vendor 占位符，机制与 Vue 相同）；画 canvas → `toDataURL` → `<img>`——**微信长按识别只认 `<img>`，canvas 不触发**。QR 内容 = `${location.origin}/j/${code}`。
+- **引擎复用**：音频/协议/重连引擎不动；把 ASR 定稿/草稿输出抽象为**双消费者**（单机模式喂 `finalLines`，字聊模式喂 `chatLines` + 发房间）。从菜单进入字聊时若正在单机收音，先确认停止。
+- **历史**：字聊会话在 host 侧 60s + pagehide upsert 进 `listen_sessions`（文本行 `我：` / `对方：` 前缀）；访客设备不落任何存储。字聊期间不写 `listen_draft`、不显示草稿横幅。
+- **挂断语义**：host「结束」= 关房（双方收 `room_closed` 退回）；guest「退出」= 离开（host 收 presence offline）；host pagehide/断网不立即关房（可重连），DO alarm 兜底。
+
+### 11.5 边界与降级
+
+| 情形 | 处置 |
+| --- | --- |
+| 访客麦克风拒绝 | 只读模式：仍收对方气泡，提示一次不挡界面 |
+| 任一端断网 | 房间 WS 退避重连（1/2/4/8s）；成功后 backlog 全量补发，定稿不丢 |
+| 心跳看门狗 | 60s 无任何房间消息（含 pong）→ 视为断线走重连 |
+| 加入窗口过期 / code 已用 | 落地屏人话文案：「邀请已过期，请对方重新发起」 |
+| 房间 2h 到期 | DO alarm 关房，双端 toast「字聊已到时长上限」+ 退回 |
+| DO 重启（极端） | meta/backlog 在 DO storage（SQLite）可恢复；成员 WS 断开重连；重连失败 → 提示重新邀请 |
+| 主机改密码 | 房间 token 全部失效（HMAC 域密钥随密码），自然关房 |
+| 双方 ghost 同时在长 | 预期行为：左右各一条半透明气泡，互不覆盖 |
+
+### 11.6 部署面变化
+
+```toml
+[durable_objects.bindings]
+name = "ROOM"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom"]
+```
+
+- worker.js 导出 `{ default: { fetch }, ChatRoom }`；SQLite 后端 DO 免费计划可用；现有 Git 构建部署流程不变（`wrangler deploy` 自动应用 migration）。
+- DO 内部：成员表（role → ws）、`meta`（created/joinDeadline/hardEnd/consumed/closed）与最近 200 条定稿存 `state.storage`，重启可恢复；`alarm()` 兜底 hardEnd 关房并 `deleteAll()` 清理残留。
 
 ---
 

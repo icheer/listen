@@ -76,6 +76,71 @@
       </footer>
     </div>
 
+    <!-- 访客落地屏（/j/<code>，PLAN.md §11.4）：无密码、极简 -->
+    <div v-else-if="screen === 'guestLanding'" class="screen gate guest-landing">
+      <h1 class="gate-title">听见 · 远程字聊</h1>
+      <p class="gate-sub">和远方的家人实时文字聊天</p>
+      <p class="invite-code-label">邀请码</p>
+      <p class="invite-code">{{ guestCode }}</p>
+      <button class="btn-main" :disabled="guestBusy" @click="joinChat">{{ guestBusy ? '加入中…' : '加入字聊' }}</button>
+      <p v-if="guestError" class="gate-error">{{ guestError }}</p>
+    </div>
+
+    <!-- 主机邀请屏：QR（img，微信长按识别只认 img）+ 邀请码 + 倒计时 -->
+    <div v-else-if="screen === 'invite'" class="screen">
+      <header class="app-header">
+        <button class="icon-btn" aria-label="取消邀请" @click="cancelInvite">←</button>
+        <div class="header-title"><h1 class="app-title">远程字聊</h1><p class="app-sub">等待对方加入…</p></div>
+        <div class="font-ctrl"></div>
+      </header>
+      <main class="invite-body">
+        <p class="invite-tip">把二维码发给对方：截图发微信，对方长按识别即可（适合异地家人）</p>
+        <img v-if="inviteQr" class="invite-qr" :src="inviteQr" alt="邀请二维码">
+        <p class="invite-code-label">或告诉对方输入邀请码</p>
+        <p class="invite-code">{{ invite ? invite.code : '' }}</p>
+        <p class="invite-countdown">{{ inviteCountdown > 0 ? '邀请码 ' + fmtCountdown(inviteCountdown) + ' 内有效' : '邀请已过期' }}</p>
+        <button v-if="inviteCountdown <= 0" class="btn-sub" @click="startChatInvite">重新生成</button>
+      </main>
+    </div>
+
+    <!-- 聊天屏（双端同构，微信式气泡三重编码：对齐/颜色/名字） -->
+    <div v-else-if="screen === 'chat'" class="screen">
+      <header class="app-header">
+        <div class="header-title"><h1 class="app-title">远程字聊</h1><p class="app-sub">{{ chatStatusText }}</p></div>
+        <div class="font-ctrl">
+          <button class="icon-btn" :disabled="fontSize <= 0" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
+        </div>
+      </header>
+      <main class="chat" :class="'font-' + fontSize" ref="chatEl" @scroll="onChatScroll">
+        <p v-if="!chatLines.length && !myGhost && !theirGhost" class="hint">{{ peerOnline ? '点下方按钮开始说话' : '等待对方加入…' }}</p>
+        <template v-for="line in chatLines" :key="line.id">
+          <p v-if="line.side === 'sys'" class="session-divider">{{ line.text }}</p>
+          <div v-else class="bubble-row" :class="line.side">
+            <div v-if="line.side === 'them'" class="bubble-name">对方</div>
+            <div class="bubble" :class="line.side">{{ line.text }}</div>
+          </div>
+        </template>
+        <div v-if="theirGhost" class="bubble-row them">
+          <div class="bubble-name">对方</div>
+          <div class="bubble them ghost">{{ theirGhost }}</div>
+        </div>
+        <div v-if="myGhost" class="bubble-row me"><div class="bubble me ghost">{{ myGhost }}</div></div>
+        <button v-if="!autoScroll && (chatLines.length || myGhost || theirGhost)" class="jump-btn" @click="scrollToBottom">↓ 回到最新</button>
+      </main>
+      <footer class="controls">
+        <p v-if="chatMicDenied" class="mic-denied">麦克风不可用，仅查看对方文字</p>
+        <button class="btn-main" :class="'btn-' + state"
+                :disabled="state === 'stopping' || state === 'connecting'"
+                @click="toggleListen">{{ mainButtonText }}</button>
+        <div class="secondary-row">
+          <button class="btn-sub" :disabled="controlsLocked || !chatText" @click="copyText(chatText, '已复制')">复制</button>
+          <button class="btn-sub end-chat" @click="endChat">{{ role === 'host' ? '结束字聊' : '退出' }}</button>
+        </div>
+      </footer>
+      <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
+    </div>
+
     <!-- 主界面 -->
     <template v-else>
       <header class="app-header">
@@ -93,6 +158,7 @@
           <button @click="copyAll">复制全文</button>
           <button @click="clearScreen">清空屏幕</button>
           <button @click="openHistory">历史记录</button>
+          <button @click="startChatInvite">远程字聊</button>
           <button @click="toggleTheme">{{ isDark ? '切换为浅色' : '切换为深色' }}</button>
           <button @click="logout">退出密码</button>
         </nav>
@@ -133,6 +199,7 @@
     </div>
   </div>
   <script src="vendor/vue.global.prod.js"></script>
+  <script src="vendor/qrcode.min.js"></script>
   <script id="listen-core">
   // ===== 协议层：纯函数，无 DOM/Vue 依赖（帧格式见 PLAN.md §2.2，可被 Node 提取单测） =====
   window.ListenProto = (function () {
@@ -263,6 +330,22 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     let historyTimer = null;  // listening 期间 60s 历史落库
     let modalResolve = null;  // 确认模态框的 Promise resolve（_confirm 用）
 
+    // ----- 远程字聊（v1.1，PLAN.md §11）：房间 WS 独立于 ASR 引擎，只传 JSON 文本 -----
+    let roomWs = null;          // 房间 WebSocket
+    let roomPingTimer = null;   // 25s 心跳
+    let roomWatchdog = null;    // 60s 无消息看门狗
+    let roomLastMsgAt = 0;
+    let roomReconnectAttempts = 0;
+    let roomToken = null;       // 本端 room token（host 建房发 / guest /api/join 换）
+    let roomCode = null;
+    let roomHardEnd = 0;
+    let myRole = null;          // 'host' | 'guest'；null = 非字聊模式
+    let inviteTimer = null;     // 邀请倒计时
+    let chatSessionId = null;   // 字聊历史会话 id（host 侧）
+    let chatStartAt = 0;
+    let chatHistoryTimer = null;
+    let roomUserEnded = false;  // 用户主动结束：断线不重连
+
     const SILENCE_100MS = new Uint8Array(3200); // 100ms 静音（16k s16le），尾包兜底用
 
     const CONFIG = {
@@ -274,6 +357,14 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       }
     };
     const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000]; // 指数退避，最多 5 次
+    const ROOM_RECONNECT_DELAYS = [1000, 2000, 4000, 8000];   // 房间 WS 退避（随后 8s 循环）
+
+    // 房间出站消息（模块级：不碰 Vue，连接断开时静默丢弃）
+    function roomSend(obj) {
+      if (roomWs && roomWs.readyState === 1) {
+        try { roomWs.send(JSON.stringify(obj)); } catch (e) {}
+      }
+    }
 
     function fmtClock(d) {
       const h = String(d.getHours()).padStart(2, '0');
@@ -305,7 +396,20 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           history: [],           // 历史列表（进面板时加载）
           historyDetail: null,   // 当前查看的历史条目
           draftRestored: false,  // 本次打开恢复了上次草稿（点开始时归档进历史）
-          draftSavedAt: 0
+          draftSavedAt: 0,
+          // ----- 远程字聊（v1.1） -----
+          role: null,           // 'host' | 'guest'（渲染 结束/退出 文案用）
+          guestCode: '',        // 访客落地页 URL 解析出的邀请码
+          guestBusy: false,
+          guestError: '',
+          invite: null,         // {code, token, joinUrl, joinDeadline, hardEnd}
+          inviteQr: '',         // dataURL（img 渲染，微信长按识别只认 img）
+          inviteCountdown: 0,
+          chatLines: [],        // [{id, side:'me'|'them'|'sys', text}]
+          myGhost: '',          // 我方草稿（半透明气泡）
+          theirGhost: '',       // 对方草稿
+          peerOnline: false,
+          chatMicDenied: false  // 访客麦克风拒绝 → 只读模式
         };
       },
       computed: {
@@ -333,13 +437,33 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
         controlsLocked() { // 收音过程中锁定清空/复制，防误触造成意外状态
           return this.state === 'listening' || this.state === 'stopping' || this.state === 'connecting';
+        },
+        chatText() { // 字聊全文（历史/复制共用，行前缀 我：/对方：）
+          return this.chatLines
+            .filter(function (l) { return l.side !== 'sys'; })
+            .map(function (l) { return (l.side === 'me' ? '我：' : '对方：') + l.text; })
+            .join('\n');
+        },
+        chatStatusText() {
+          if (this.state === 'listening') return '正在听写';
+          if (this.state === 'connecting') return '连接中…';
+          if (this.state === 'stopping') return '正在结束…';
+          if (this.state === 'error') return this.errorMsg || '出错了';
+          return this.peerOnline ? '已连接' : '等待对方加入…';
         }
       },
       mounted() {
         const saved = parseInt(localStorage.getItem('fontSize'), 10);
         if (saved >= 0 && saved <= 9) this.fontSize = saved;
         this._applyTheme(this._resolveTheme());
-        this._restoreDraft(); // 恢复上次草稿（沿用旧版「刷新不丢字」体验，PLAN.md §4.6）
+        // 访客路径 /j/<code>：免密码，直接进落地屏（不恢复草稿——访客设备不落任何存储，§11.4）
+        const gm = location.pathname.match(/^\/j\/([A-Za-z0-9]{4,16})\/?$/);
+        if (gm) {
+          this.screen = 'guestLanding';
+          this.guestCode = gm[1].toUpperCase();
+        } else {
+          this._restoreDraft(); // 恢复上次草稿（沿用旧版「刷新不丢字」体验，PLAN.md §4.6）
+        }
         draftTimer = setInterval(() => this._saveDraft(), 30000);
         // click outside 关菜单：点菜单和 ⚙ 本身以外的任何区域都收起（⚙ 由自身 @click 切换，这里跳过）
         if (document.addEventListener) {
@@ -546,6 +670,260 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           return first.length > 40 ? first.slice(0, 40) + '…' : first;
         },
 
+        // ---------- 远程字聊（v1.1，PLAN.md §11.4） ----------
+        fmtCountdown(sec) {
+          const m = Math.floor(sec / 60), s = sec % 60;
+          return m + ':' + String(s).padStart(2, '0');
+        },
+
+        // 主机：⚙ 菜单 → 建房 → 邀请屏
+        async startChatInvite() {
+          this.menuOpen = false;
+          if (this.state === 'stopping' || this.state === 'connecting') { this.toast('请等当前操作结束'); return; }
+          if (this.state === 'listening') {
+            if (!(await this._confirm('正在听写。开始远程字聊会先停止收音，继续吗？'))) return;
+            this.stopListening();
+            const t0 = Date.now();
+            while (this.state !== 'idle' && Date.now() - t0 < 4000) {
+              await new Promise(r => setTimeout(r, 200));
+            }
+          }
+          let ticket;
+          try { ticket = await this._ensureTicket(); } catch (e) { this.toast('网络问题，请检查网络'); return; }
+          if (!ticket) return; // 密码门已弹出
+          let resp;
+          try {
+            resp = await fetch('/api/room', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ticket: ticket })
+            });
+          } catch (e) { this.toast('网络问题，请检查网络'); return; }
+          if (!resp.ok) { this.toast('创建失败，请稍后重试'); return; }
+          const d = await resp.json();
+          roomToken = d.token; roomCode = d.code; roomHardEnd = d.hardEnd; myRole = 'host';
+          this.role = 'host';
+          this.invite = d;
+          this.inviteQr = '';
+          this.chatLines = []; this.myGhost = ''; this.theirGhost = ''; this.peerOnline = false;
+          this.chatMicDenied = false;
+          this._renderQr();
+          this._openRoomWs();
+          this.screen = 'invite';
+          this._startInviteCountdown();
+        },
+        _startInviteCountdown() {
+          if (inviteTimer) clearInterval(inviteTimer);
+          const tick = () => {
+            this.inviteCountdown = Math.max(0, Math.ceil(((this.invite ? this.invite.joinDeadline : 0) - Date.now()) / 1000));
+          };
+          tick();
+          inviteTimer = setInterval(tick, 1000);
+        },
+        async cancelInvite() { // 邀请屏返回：房间还没人用，直接关房
+          if (this.peerOnline) return this.endChat();
+          this._chatUpsertHistory();
+          this._chatTeardown({ closeRoom: true });
+          this.screen = 'main';
+        },
+        _renderQr() { // canvas → dataURL → <img>（微信长按识别只认 img，§11.4）
+          if (typeof qrcode === 'undefined') { this.inviteQr = ''; return; }
+          try {
+            const qr = qrcode(0, 'M');
+            qr.addData(location.origin + '/j/' + this.invite.code);
+            qr.make();
+            const n = qr.getModuleCount();
+            const cell = 8, margin = 2;
+            const size = (n + margin * 2) * cell;
+            const cv = document.createElement('canvas');
+            cv.width = cv.height = size;
+            const ctx = cv.getContext('2d');
+            ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, size, size);
+            ctx.fillStyle = '#0f172a';
+            for (let r = 0; r < n; r++) {
+              for (let c = 0; c < n; c++) {
+                if (qr.isDark(r, c)) ctx.fillRect((margin + c) * cell, (margin + r) * cell, cell, cell);
+              }
+            }
+            this.inviteQr = cv.toDataURL('image/png');
+          } catch (e) { this.inviteQr = ''; }
+        },
+
+        // 访客：落地屏 → /api/join → 聊天屏
+        async joinChat() {
+          if (this.guestBusy) return;
+          this.guestBusy = true;
+          this.guestError = '';
+          try {
+            const resp = await fetch('/api/join', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code: this.guestCode })
+            });
+            if (!resp.ok) {
+              const d = await resp.json().catch(() => ({}));
+              this.guestError = d.error || '加入失败，请稍后再试';
+              return;
+            }
+            const d = await resp.json();
+            roomToken = d.token; roomCode = this.guestCode; roomHardEnd = d.hardEnd; myRole = 'guest';
+            this.role = 'guest';
+            this.chatLines = []; this.myGhost = ''; this.theirGhost = ''; this.peerOnline = false;
+            this.chatMicDenied = false;
+            this._openRoomWs();
+            this.screen = 'chat';
+          } catch (e) {
+            this.guestError = '网络问题，请检查网络';
+          } finally {
+            this.guestBusy = false;
+          }
+        },
+
+        // 房间 WS 客户端（§11.3）
+        _openRoomWs() {
+          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+          const sock = new WebSocket(proto + '://' + location.host + '/room/' + roomCode + '?token=' + encodeURIComponent(roomToken));
+          roomWs = sock;
+          sock.onopen = () => {
+            roomLastMsgAt = Date.now();
+            if (roomPingTimer) clearInterval(roomPingTimer);
+            roomPingTimer = setInterval(() => roomSend({ t: 'ping' }), 25000);
+            if (roomWatchdog) clearInterval(roomWatchdog);
+            roomWatchdog = setInterval(() => {
+              if (Date.now() - roomLastMsgAt > 60000) { // 60s 无消息：视为死连接触发重连
+                console.warn('[listen] 房间心跳超时，重连');
+                try { sock.close(); } catch (e) {}
+              }
+            }, 5000);
+            roomReconnectAttempts = 0;
+          };
+          sock.onmessage = (e) => { roomLastMsgAt = Date.now(); this._onRoomMessage(e.data); };
+          sock.onclose = (e) => {
+            if (roomWs === sock) roomWs = null;
+            if (roomPingTimer) { clearInterval(roomPingTimer); roomPingTimer = null; }
+            if (roomWatchdog) { clearInterval(roomWatchdog); roomWatchdog = null; }
+            if (roomUserEnded || e.code === 4000) return; // 主动结束 / 被自己新连接顶替
+            this._scheduleRoomReconnect();
+          };
+        },
+        _onRoomMessage(data) {
+          let m;
+          try { m = JSON.parse(data); } catch (e) { return; }
+          if (m.t === 'welcome') {
+            if (m.backlog && m.backlog.length) { // 重连：权威序整体重建
+              this.chatLines = m.backlog.map(l => ({
+                id: 'b-' + l.from + '-' + l.seq,
+                side: l.from === myRole ? 'me' : 'them',
+                text: l.text
+              }));
+              this._chatSys('连接已恢复');
+            }
+            this.peerOnline = !!m.peerOnline;
+            if (this.peerOnline) { this._chatEnsureSession(); if (this.screen === 'invite') this.screen = 'chat'; }
+            this._scrollToBottom();
+          } else if (m.t === 'line') {
+            const mine = m.from === myRole;
+            if (m.kind === 'final') {
+              this.chatLines.push({ id: 'r-' + m.from + '-' + (m.seq != null ? m.seq : Date.now()), side: mine ? 'me' : 'them', text: m.text });
+              if (mine) this.myGhost = ''; else this.theirGhost = '';
+            } else { // ghost：同侧 final 到达即被替换（§11.3，不依赖 key 匹配）
+              if (mine) this.myGhost = m.text; else this.theirGhost = m.text;
+            }
+            this._chatEnsureSession();
+            this._scrollToBottom();
+          } else if (m.t === 'presence') {
+            this.peerOnline = !!m.online;
+            if (m.online) {
+              this._chatSys('对方已加入');
+              this._chatEnsureSession();
+              if (this.screen === 'invite') this.screen = 'chat';
+            } else {
+              this._chatSys('对方已离开');
+            }
+          } else if (m.t === 'room_closed') {
+            this._chatUpsertHistory();
+            this._chatTeardown({ local: false });
+            this.toast(m.reason === 'expired' ? '字聊已到时长上限' : '字聊已结束');
+            if (this.role === 'guest' || myRole === 'guest') {
+              this.screen = 'guestLanding';
+              this.guestError = '本次字聊已结束，请对方重新发起';
+            } else {
+              this.screen = 'main';
+            }
+          }
+        },
+        _scheduleRoomReconnect() {
+          if (roomUserEnded) return;
+          if (Date.now() > roomHardEnd) { // 房间已到硬顶：别再打
+            this._chatUpsertHistory();
+            this._chatTeardown({ local: false });
+            this.toast('字聊已到时长上限');
+            this.screen = myRole === 'guest' ? 'guestLanding' : 'main';
+            if (this.screen === 'guestLanding') this.guestError = '本次字聊已结束，请对方重新发起';
+            return;
+          }
+          const delay = ROOM_RECONNECT_DELAYS[Math.min(roomReconnectAttempts, ROOM_RECONNECT_DELAYS.length - 1)];
+          roomReconnectAttempts++;
+          this._chatSys('连接断开，正在重连…');
+          setTimeout(() => { if (!roomUserEnded && !roomWs) this._openRoomWs(); }, delay);
+        },
+        _chatSys(text) {
+          this.chatLines.push({ id: 'sys-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), side: 'sys', text: text });
+          this._scrollToBottom();
+        },
+        _chatEnsureSession() { // host 侧：首条内容/对方加入时开历史会话 + 60s 落库
+          if (myRole !== 'host' || chatSessionId) return;
+          chatSessionId = 'c-' + Date.now();
+          chatStartAt = Date.now();
+          if (chatHistoryTimer) clearInterval(chatHistoryTimer);
+          chatHistoryTimer = setInterval(() => this._chatUpsertHistory(), 60000);
+        },
+        _chatUpsertHistory() { // host 侧字聊历史（我：/对方： 前缀）；guest 不落任何存储
+          if (myRole !== 'host' || !chatSessionId) return;
+          const text = this.chatText;
+          if (!text) return;
+          const list = this._historyLoad();
+          const entry = { id: chatSessionId, startedAt: chatStartAt || Date.now(), endedAt: Date.now(), text: text };
+          const idx = list.findIndex(s => s.id === chatSessionId);
+          if (idx >= 0) list[idx] = entry; else list.unshift(entry);
+          this._historySave(list);
+        },
+        async endChat() { // host「结束」= 关房（双方退出）；guest「退出」= 离开
+          const isHost = myRole === 'host';
+          if (!(await this._confirm(isHost ? '结束字聊？双方都会退出。' : '退出字聊？'))) return;
+          if (this.state === 'listening') this.stopListening();
+          this._chatUpsertHistory();
+          this._chatTeardown({ sendBye: !isHost, closeRoom: isHost });
+          this.screen = isHost ? 'main' : 'guestLanding';
+          if (!isHost) this.guestError = '已退出本次字聊，请对方重新发起';
+        },
+        _chatTeardown(opts) {
+          const o = opts || {};
+          if (o.sendBye) roomSend({ t: 'bye' });
+          if (o.closeRoom && myRole === 'host') roomSend({ t: 'close' });
+          roomUserEnded = true;
+          if (roomPingTimer) { clearInterval(roomPingTimer); roomPingTimer = null; }
+          if (roomWatchdog) { clearInterval(roomWatchdog); roomWatchdog = null; }
+          if (inviteTimer) { clearInterval(inviteTimer); inviteTimer = null; }
+          if (chatHistoryTimer) { clearInterval(chatHistoryTimer); chatHistoryTimer = null; }
+          if (roomWs) {
+            roomWs.onopen = roomWs.onmessage = roomWs.onclose = null;
+            try { roomWs.close(); } catch (e) {}
+            roomWs = null;
+          }
+          myRole = null; roomToken = null; roomCode = null; roomHardEnd = 0;
+          roomReconnectAttempts = 0;
+          chatSessionId = null; chatStartAt = 0;
+          this.role = null;
+          this.peerOnline = false;
+          this.myGhost = ''; this.theirGhost = '';
+        },
+        onChatScroll() {
+          const el = this.$refs.chatEl;
+          if (!el) return;
+          this.autoScroll = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        },
+
         // ---------- 滚动（PLAN.md §4.3：自动滚底，上滑暂停，浮标回底） ----------
         onScroll() {
           const el = this.$refs.transcriptEl;
@@ -558,7 +936,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
         async _scrollToBottom() {
           await this.$nextTick();
-          const el = this.$refs.transcriptEl;
+          const el = this.$refs.chatEl || this.$refs.transcriptEl; // 单机/字聊共用（同屏只渲染其一）
           if (el && this.autoScroll) el.scrollTop = el.scrollHeight;
         },
 
@@ -596,23 +974,37 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             reconnectAttempts = 0;
             if (navigator.vibrate) navigator.vibrate(50);
             this._acquireWakeLock(); // 常亮不 await：拿不到不阻塞收音
-            if (!this.__debugNoMic) await this._openMic(); // 真机开麦；调试模式跳过
+            try {
+              if (!this.__debugNoMic) await this._openMic(); // 真机开麦；调试模式跳过
+            } catch (micErr) {
+              if (myRole) { // 字聊模式：麦克风不可用 → 只读降级，聊天不中断（§11.5）
+                this.chatMicDenied = true;
+                this.state = 'idle';
+                this.toast('麦克风不可用，本次仅收字');
+                return;
+              }
+              throw micErr;
+            }
             const ok = await this._connectSession();
             if (!ok) {
               if (this.screen === 'gate') this.state = 'idle'; // 密码门已弹出，等用户输入
               else if (this.state !== 'error') this._setError(new Error('连不上语音服务，请点重试。'));
               return;
             }
-            if (this.draftRestored) { // 上次草稿归档进历史（PLAN.md §4.6）
-              this._archiveDraft();
-              this.draftRestored = false;
-              localStorage.removeItem('listen_draft');
+            if (!myRole) { // 单机模式独有：草稿归档 + 会话分隔 + 单机历史计时
+              if (this.draftRestored) { // 上次草稿归档进历史（PLAN.md §4.6）
+                this._archiveDraft();
+                this.draftRestored = false;
+                localStorage.removeItem('listen_draft');
+              }
+              if (this.finalLines.length) { // 再点开始 = 新会话，旧文保留加分隔（PLAN.md §4.5）
+                this.finalLines.push({ key: 'd-' + Date.now(), type: 'divider', label: fmtClock(new Date()) });
+              }
+              sessionId = 's-' + Date.now();
+              if (historyTimer) clearInterval(historyTimer);
+              historyTimer = setInterval(() => this._upsertSession(), 60000);
             }
             committedKeys = new Set();
-            if (this.finalLines.length) { // 再点开始 = 新会话，旧文保留加分隔（PLAN.md §4.5）
-              this.finalLines.push({ key: 'd-' + Date.now(), type: 'divider', label: fmtClock(new Date()) });
-            }
-            sessionId = 's-' + Date.now();
             this.state = 'listening';
             listenStartAt = Date.now();
             this.elapsedSec = 0;
@@ -620,8 +1012,6 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             tickTimer = setInterval(() => {
               this.elapsedSec = Math.floor((Date.now() - listenStartAt) / 1000);
             }, 1000);
-            if (historyTimer) clearInterval(historyTimer);
-            historyTimer = setInterval(() => this._upsertSession(), 60000);
           } catch (e) {
             console.error('[listen] start failed:', e);
             this._setError(this._friendlyError(e));
@@ -680,8 +1070,11 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
           if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
           if (historyTimer) { clearInterval(historyTimer); historyTimer = null; }
-          this._upsertSession(); // 收尾统一落一条历史（正常结束/出错/超时都保留已出文字）
-          this._saveDraft();
+          if (myRole) this._chatUpsertHistory(); // 字聊模式：落字聊历史，不写单机草稿/会话（§11.4）
+          else {
+            this._upsertSession(); // 收尾统一落一条历史（正常结束/出错/超时都保留已出文字）
+            this._saveDraft();
+          }
           this._releaseWakeLock();
           if (srcNode) { try { srcNode.disconnect(); } catch (e) {} srcNode = null; }
           if (workletNode) { try { workletNode.disconnect(); } catch (e) {} workletNode = null; }
@@ -728,13 +1121,17 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             let settled = false;
             const done = function (ok) { if (!settled) { settled = true; resolve(ok); } };
             let ticket;
-            try {
-              ticket = await self._ensureTicket();
-            } catch (e) {
-              self._setError(new Error('网络问题，请检查网络'));
-              return done(false);
+            if (roomToken) {
+              ticket = roomToken; // 字聊模式（host/guest 共用此路径）：/ws 凭 room token
+            } else {
+              try {
+                ticket = await self._ensureTicket();
+              } catch (e) {
+                self._setError(new Error('网络问题，请检查网络'));
+                return done(false);
+              }
+              if (!ticket) return done(false);
             }
-            if (!ticket) return done(false);
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             const sock = new WebSocket(proto + '://' + location.host + '/ws?ticket=' + encodeURIComponent(ticket));
             ws = sock;
@@ -761,9 +1158,15 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             this.state = 'idle';
             return;
           }
-          if (wasListening && this.interimText) { // 异常断开：草稿句服务端不会再补发，落成定稿保留
-            this.finalLines.push({ key: 'i-' + Date.now(), text: this.interimText });
-            this.interimText = '';
+          if (wasListening && (myRole ? this.myGhost : this.interimText)) { // 异常断开：草稿句服务端不会再补发，落成定稿保留
+            if (myRole) {
+              this.chatLines.push({ id: 'iz-' + Date.now(), side: 'me', text: this.myGhost });
+              roomSend({ t: 'line', kind: 'final', key: 'z-' + Date.now(), text: this.myGhost });
+              this.myGhost = '';
+            } else {
+              this.finalLines.push({ key: 'i-' + Date.now(), text: this.interimText });
+              this.interimText = '';
+            }
           }
           if (wasListening) { this._scheduleReconnect(e); return; }
           if (this.state === 'connecting') this._setError(new Error('连接断开，请重试。'));
@@ -799,6 +1202,10 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         _onNewSession(label) { // 重连/恢复成功 = 新会话：重置去重集合、插分隔行、回 listening
           reconnectAttempts = 0;
           committedKeys = new Set(); // 新会话时间戳从头计，旧 key 集合必须换新（否则同 key 定稿行会被误丢）
+          if (myRole) { // 字聊模式：不插分隔行，历史会话延续
+            this.state = 'listening';
+            return;
+          }
           if (this.finalLines.length) {
             this.finalLines.push({ key: 'd-' + Date.now(), type: 'divider', label: fmtClock(new Date()) + ' ' + label });
           }
@@ -830,7 +1237,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           console.log('[listen] resp seq=' + f.seq + ' flags=' + f.flags.toString(2).padStart(4, '0'), j);
           if (j && j.result) this._applyResult(j.result);
         },
-        _applyResult(result) { // 累积算法 PLAN.md §4.3
+        _applyResult(result) { // 累积算法 PLAN.md §4.3；字聊模式双消费者（§11.4：喂 chatLines + 发房间）
           const utts = result.utterances || [];
           let interim = '';
           for (let i = 0; i < utts.length; i++) {
@@ -839,13 +1246,25 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               const key = u.start_time + '-' + u.end_time;
               if (committedKeys && !committedKeys.has(key)) {
                 committedKeys.add(key);
-                this.finalLines.push({ key: key, text: u.text });
+                if (myRole) {
+                  this.chatLines.push({ id: 'me-' + key, side: 'me', text: u.text });
+                  roomSend({ t: 'line', kind: 'final', key: key, text: u.text });
+                } else {
+                  this.finalLines.push({ key: key, text: u.text });
+                }
               }
             } else {
               interim = u.text; // 最多一个非 definite，取最后一个
             }
           }
-          this.interimText = interim;
+          if (myRole) {
+            if (this.myGhost !== interim) { // 草稿有变才发（节流）
+              this.myGhost = interim;
+              roomSend({ t: 'line', kind: 'interim', key: '', text: interim });
+            }
+          } else {
+            this.interimText = interim;
+          }
           this._scrollToBottom();
         },
 
@@ -869,6 +1288,12 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         __debugFinish() { return this.stopListening(); },
         __debugSimulateDrop() { // 模拟断网：ws 包有 terminate（Node 测试用）；浏览器无则跳过
           if (ws && ws.terminate) ws.terminate();
+        },
+        __debugRoomDrop() { // 模拟房间 WS 断线（Node 测试用）
+          if (roomWs && roomWs.terminate) roomWs.terminate();
+        },
+        __debugRoomState() { // 测试断言用：暴露房间模块级状态
+          return { role: myRole, code: roomCode, hasWs: !!(roomWs && roomWs.readyState === 1) };
         }
       }
     });
@@ -877,12 +1302,15 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
 
     // ---------- 生命周期：pagehide 尽力停止；回前台重拿常亮 + 连接体检 ----------
     if (window.addEventListener) {
-      window.addEventListener('pagehide', () => { // 先落草稿/历史，再尽力走停止流程
+      window.addEventListener('pagehide', () => { // 先落历史/草稿，再尽力走停止流程
+        if (vm.role === 'host') vm._chatUpsertHistory(); // 字聊历史（host 侧）
         if (vm.state === 'listening') {
-          vm._saveDraft();
-          vm._upsertSession();
+          if (!vm.role) { // 单机模式：草稿 + 会话落库
+            vm._saveDraft();
+            vm._upsertSession();
+          }
           vm.stopListening();
-        } else {
+        } else if (!vm.role) {
           vm._saveDraft();
         }
       });
@@ -890,6 +1318,9 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     if (window.addEventListener && document.addEventListener) {
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState !== 'visible') return;
+        if (vm.role && (!roomWs || roomWs.readyState !== 1) && !roomUserEnded) {
+          vm._openRoomWs(); // 房间 WS 挂起期间死掉：立即重连（backlog 补发定稿）
+        }
         if (vm.state !== 'listening') return;
         vm._acquireWakeLock(); // 常亮锁在后台会被系统回收，回前台重申请
         if (!ws || ws.readyState !== 1) { // 挂起期间连接已死：跳过剩余退避立即重连
