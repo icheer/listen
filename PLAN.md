@@ -263,6 +263,12 @@ onResponse(utterances):
 - 自动滚到底部；用户手指上滑查看历史时暂停自动滚动，回到底部（显示「↓ 回到最新」浮标）再恢复。
 - 定稿行与草稿行都用 `text` 字段；`words` 时间戳 v1 不用。
 
+**静音草稿转正（v1.1.2）**：连续说话时大模型中间不出 definite，草稿要等到停止才转正（对讲机感）。客户端本地判定提前转正，服务端定稿到达后**原位对账**（防双份文本）：
+
+- 判定：worklet 每 200ms 块附带 RMS（`{int16, rms}`）；`rms > 300`（VOICE_RMS）记为有声更新 `lastVoiceAt`；`listening && 有草稿 && 静音 ≥ 1500ms`（SILENCE_PROMOTE_MS）→ 草稿落为定稿行。阈值方向宁可保守——截断的半句永远不会自动合并。环境噪音持续有声时自然退化为旧行为。rms 缺省（调试注入）按有声处理。
+- 对账：转正行 key = `p<会话nonce>-<interimStart>`（nonce 每段 ASR 会话轮换，防跨会话 start_time 撞号）。服务端 definite 到达时：**同 `start_time` 的转正行原位替换文本**（升级为带标点终稿，位置不动）；`[start_time, end_time)` 覆盖的其他转正行删除（服务端合并短句）；锚点失配时兜底「唯一候选行且定稿文本以草稿文本（去标点）开头」也按替换处理。
+- 字聊模式同款：转正即发 `line final`，对账后广播 `revise`（见 §11.3）；DO 存储与对端同样原位修正，重连 backlog 即修正后的版本。
+
 ### 4.4 适老化与无障碍（硬需求）
 
 | 项 | 设计 |
@@ -298,8 +304,8 @@ onResponse(utterances):
 
 ### 4.6 转写持久化与历史记录（Phase 6）
 
-- **刷新恢复（沿用旧版体验）**：当前屏幕文本每 30s + `pagehide` 写 localStorage `listen_draft`（`{text, savedAt}`），重载时恢复显示并顶部标注「上次内容 · 可清空」；点开始新会话后草稿归档进历史。
-- 历史 localStorage `listen_sessions`：`[{id, startedAt, endedAt, text}]`，停止时落一条（text = 全部定稿行拼接）；上限 50 条、总量 < 2MB 超出删最旧。
+- **刷新恢复（沿用旧版体验）**：当前屏幕文本每 30s + `pagehide` 写 localStorage `listen_draft`（`{text, savedAt}`），重载时恢复显示并顶部标注「上次内容 · 可清空」；点开始后草稿并入当前屏幕这条历史（v1.1.1 起不再单独归档）。
+- 历史 localStorage `listen_sessions`：`[{id, startedAt, endedAt, text}]`，**一屏一记录**：同一屏幕（未清空）跨多次开始/停止始终 upsert 同一条（id 不变、文本累计、startedAt 取首段），「清空屏幕」终结该条、下一段对话开新条目；上限 50 条、总量 < 2MB 超出删最旧。
 - 历史面板：列表（起止时间 + 预览）→ 点开全文 → 复制 / 删除。
 
 ## 5. 视觉规范（token）
@@ -432,6 +438,7 @@ node src/deploy.js && npx wrangler deploy
 | S→C | `{"t":"welcome","role","peerOnline","backlog":[…]}` | 建连即回；backlog = 全部已存定稿（权威序），客户端**整体重建**气泡列表 |
 | S→C | `{"t":"line","from":"host"\|"guest","kind","key","text","seq"}` | 接收端 `from` ≠ 自己 → 对方侧气泡；seq 为 DO 单调计数（信息性，留作未来排序需要） |
 | S→C | `{"t":"presence","online":bool}` | 对方加入/离开（「对方已加入」「对方已离开」系统消息） |
+| C→S | `{"t":"revise","key","text","drop":[…]}` | **定稿对账（v1.1.2 草稿转正）**：drop 中的行移除、命中 key 的行原位换文本（保位置），未命中则追加；DO 存储同步修正（backlog 即修正版）并转发对端 |
 | S→C | `{"t":"room_closed","reason"}` / `{"t":"pong"}` / `{"t":"error","msg"}` | 房间到期或主机结束 / 心跳回应 / 错误人话文案 |
 
 **渲染规则（双端对称 = §4.3 算法 × 两侧）**：definite 追加实气泡；interim 显示为该侧**半透明 ghost 气泡**，同侧新 final 到达即清空该侧 ghost（ghost 替换不依赖 key 相等——definite 的 key 与 interim 的不保证一致）；双方 ghost 并存互不干扰（同聊天应用「正在输入」位，天然容纳同时说话）。排序按到达序；罕见双端顺序不一致在聊天语义下无害。

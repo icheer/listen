@@ -213,3 +213,25 @@ node src/deploy.js && node test/core-test.mjs && node test/app-e2e.mjs && node t
 □ 断网恢复 / 锁屏回来 → 不丢定稿、自动恢复、出现「连接已恢复」系统消息
 □ host 结束字聊 → 双端退出；主机历史里完整对话（我：/对方：前缀）可复制
 ```
+
+---
+
+## v1.1.2 · 体验修复（2026-09-29 真机反馈）
+
+## Phase 10 · FOUC / 历史一屏一记录 / 静音草稿转正
+
+- [x] FOUC：根容器 `v-cloak` + CSS `[v-cloak]{display:none!important}`（Vue 挂载后自动移除属性，模板花括号不再闪现）
+- [x] 历史一屏一记录：`sessionId` 跨多次开始/停止复用（`clearScreen` 才终结、开新条目）；恢复的草稿并入当前屏幕这条记录（删除 `_archiveDraft` 的 `d-` 独立归档路径）；`startedAt` 取首段时刻（`sessionStartAt`）
+- [x] 静音草稿转正（单机 + 字聊双模式，PLAN.md §4.3 增补）：
+  - worklet 每块附带 RMS（`{int16, rms}`）；`rms>300` 记有声；`listening && 有草稿 && 静音≥1500ms` → 本地转正（400ms 轮询 timer）
+  - 对账防双份：转正行 key=`p<nonce>-<interimStart>`（nonce 每 ASR 会话轮换）；服务端 definite 同 `start_time` 原位替换、区间覆盖删除、文本前缀兜底
+  - 字聊：转正发 `line final`，对账广播 `revise`；DO 存储/对端/backlog 同步原位修正（worker.js ChatRoom 增 revise 处理）
+- [x] 测试：core-test worklet RMS 断言；app-e2e 场景5（一屏一记录）+ 场景6/6b（单机/字聊静音转正+对账，真实 ASR 验证 duck 只出现一次）；room-e2e revise 中继/backlog 修正用例
+
+**验收**：
+```bash
+node test/core-test.mjs && node test/room-e2e.mjs && node test/app-e2e.mjs && node test/ui-browser-test.mjs
+# 20/20 + 30/30 + 53/53 + 26/26（2026-09-29 全绿）
+# 真机手测（待用户）：说话停顿 ~1.5s 草稿即转正变深色；继续说则新草稿另起一行；
+# 停止后无重复句；字聊对端看到气泡先无标点、随后原位更新为带标点终稿
+```

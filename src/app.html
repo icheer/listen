@@ -15,7 +15,7 @@
   <link rel="apple-touch-icon" href="/icon-192.png">
 </head>
 <body>
-  <div id="app">
+  <div id="app" v-cloak>
     <!-- 密码门 -->
     <div v-if="screen === 'gate'" class="gate">
       <h1 class="gate-title">听见</h1>
@@ -285,6 +285,7 @@ class ListenPcmProcessor extends AudioWorkletProcessor {
     this.len += ch.length;
     while (this.len >= this.blockIn) {
       const pcm = new Int16Array(3200);               // 200ms @ 16k s16le
+      let rmsSum = 0;                                  // 块 RMS：静音检测（草稿转正）用
       for (let i = 0; i < 3200; i++) {
         const pos = i * this.ratio;
         const i0 = Math.floor(pos);
@@ -294,8 +295,9 @@ class ListenPcmProcessor extends AudioWorkletProcessor {
         let v = a + (b - a) * frac;
         v = v < -1 ? -1 : v > 1 ? 1 : v;
         pcm[i] = Math.round(v * 32767);
+        rmsSum += pcm[i] * pcm[i];
       }
-      this.port.postMessage({ int16: pcm.buffer }, [pcm.buffer]);   // transferable
+      this.port.postMessage({ int16: pcm.buffer, rms: Math.sqrt(rmsSum / 3200) }, [pcm.buffer]);   // transferable
       const consumed = Math.round(3200 * this.ratio);
       this.buf.copyWithin(0, consumed, this.len);
       this.len -= consumed;
@@ -325,7 +327,8 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     let stopTimer = null;
     let toastTimer = null;
     let wakeLock = null;      // ScreenWakeLock（listening 时常亮，PLAN.md §4.4 核心需求）
-    let sessionId = null;     // 当前会话 id（历史落库用）
+    let sessionId = null;     // 当前屏幕的历史记录 id（一屏一记录：清空前跨多次开始/停止复用）
+    let sessionStartAt = 0;   // 该条记录的起始时间（首段开始时刻，后续段不重置）
     let draftTimer = null;    // 草稿 30s 落盘
     let historyTimer = null;  // listening 期间 60s 历史落库
     let modalResolve = null;  // 确认模态框的 Promise resolve（_confirm 用）
@@ -346,6 +349,12 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     let chatHistoryTimer = null;
     let roomUserEnded = false;  // 用户主动结束：断线不重连
 
+    // ----- 静音草稿转正（v1.1.2）：状态 -----
+    let lastVoiceAt = 0;        // 最近一次「有声」块的时刻（worklet RMS 判定）
+    let interimStart = 0;       // 当前草稿句的 start_time（对账锚点，协议实测与定稿同值）
+    let silenceTimer = null;    // 400ms 轮询：静音超阈值即本地转正
+    let asrNonce = '0';         // 本段 ASR 会话随机串：转正行 key 前缀域，防跨会话 start_time 撞号误对账
+
     const SILENCE_100MS = new Uint8Array(3200); // 100ms 静音（16k s16le），尾包兜底用
 
     const CONFIG = {
@@ -358,12 +367,19 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     };
     const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000]; // 指数退避，最多 5 次
     const ROOM_RECONNECT_DELAYS = [1000, 2000, 4000, 8000];   // 房间 WS 退避（随后 8s 循环）
+    const SILENCE_PROMOTE_MS = 1500; // 静音多久把草稿本地转正（v1.1.2；宁可保守：截断的半句不会自动合并）
+    const VOICE_RMS = 300;          // 16-bit PCM 块 RMS 的「有声」阈值（NS+AGC 后噪声底远低于此）
 
     // 房间出站消息（模块级：不碰 Vue，连接断开时静默丢弃）
     function roomSend(obj) {
       if (roomWs && roomWs.readyState === 1) {
         try { roomWs.send(JSON.stringify(obj)); } catch (e) {}
       }
+    }
+
+    // 定稿/草稿宽松比对（去标点空白后前者以后者开头）——start_time 锚点失配时的对账兜底
+    function normSpeech(s) {
+      return String(s || '').replace(/[\s，。、！？,.!?：；;:"“”‘’']/g, '');
     }
 
     function fmtClock(d) {
@@ -545,6 +561,8 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           this.finalLines = [];
           this.interimText = '';
           if (committedKeys) committedKeys = new Set();
+          sessionId = null; // 清空 = 屏幕生命周期终点，下一段对话开新历史条目
+          sessionStartAt = 0;
           this.draftRestored = false;
           localStorage.removeItem('listen_draft');
           this.menuOpen = false;
@@ -600,13 +618,6 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             localStorage.setItem('listen_draft', JSON.stringify({ text: text, savedAt: Date.now() }));
           } catch (e) {} // 隐私模式等配额异常：丢草稿不崩
         },
-        _archiveDraft() { // 恢复过的草稿在开新会话时归档进历史
-          const text = this.fullText;
-          if (!text) return;
-          const list = this._historyLoad();
-          list.unshift({ id: 'd-' + Date.now(), startedAt: this.draftSavedAt, endedAt: Date.now(), text: text });
-          this._historySave(list);
-        },
         _historyLoad() {
           try { return JSON.parse(localStorage.getItem('listen_sessions') || '[]'); } catch (e) { return []; }
         },
@@ -628,7 +639,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           const text = this.fullText + (this.interimText ? '\n' + this.interimText : '');
           if (!text) return;
           const list = this._historyLoad();
-          const entry = { id: sessionId, startedAt: listenStartAt || Date.now(), endedAt: Date.now(), text: text };
+          const entry = { id: sessionId, startedAt: sessionStartAt || listenStartAt || Date.now(), endedAt: Date.now(), text: text };
           const idx = list.findIndex(s => s.id === sessionId);
           if (idx >= 0) list[idx] = entry; else list.unshift(entry);
           this._historySave(list);
@@ -810,11 +821,12 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           let m;
           try { m = JSON.parse(data); } catch (e) { return; }
           if (m.t === 'welcome') {
-            if (m.backlog && m.backlog.length) { // 重连：权威序整体重建
+            if (m.backlog && m.backlog.length) { // 重连：权威序整体重建（k 保留，revise 仍可对账）
               this.chatLines = m.backlog.map(l => ({
                 id: 'b-' + l.from + '-' + l.seq,
                 side: l.from === myRole ? 'me' : 'them',
-                text: l.text
+                text: l.text,
+                k: l.key
               }));
               this._chatSys('连接已恢复');
             }
@@ -824,10 +836,26 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           } else if (m.t === 'line') {
             const mine = m.from === myRole;
             if (m.kind === 'final') {
-              this.chatLines.push({ id: 'r-' + m.from + '-' + (m.seq != null ? m.seq : Date.now()), side: mine ? 'me' : 'them', text: m.text });
+              this.chatLines.push({ id: 'r-' + m.from + '-' + (m.seq != null ? m.seq : Date.now()), side: mine ? 'me' : 'them', text: m.text, k: m.key });
               if (mine) this.myGhost = ''; else this.theirGhost = '';
             } else { // ghost：同侧 final 到达即被替换（§11.3，不依赖 key 匹配）
               if (mine) this.myGhost = m.text; else this.theirGhost = m.text;
+            }
+            this._chatEnsureSession();
+            this._scrollToBottom();
+          } else if (m.t === 'revise') { // 对端定稿对账：drop 的行移除，命中行原位换文本（位置不动）
+            const drops = Array.isArray(m.drop) ? m.drop : [];
+            let idx = -1;
+            for (let i = 0; i < this.chatLines.length; i++) {
+              const l = this.chatLines[i];
+              if (l.k && (drops.indexOf(l.k) >= 0 || l.k === m.key)) { idx = i; break; }
+            }
+            if (idx >= 0) {
+              const old = this.chatLines[idx];
+              this.chatLines.splice(idx, 1, { id: old.id, side: old.side, text: m.text, k: m.key });
+              this.chatLines = this.chatLines.filter((l, i) => i === idx || !(l.k && drops.indexOf(l.k) >= 0));
+            } else {
+              this.chatLines.push({ id: 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), side: 'them', text: m.text, k: m.key });
             }
             this._chatEnsureSession();
             this._scrollToBottom();
@@ -991,27 +1019,34 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               else if (this.state !== 'error') this._setError(new Error('连不上语音服务，请点重试。'));
               return;
             }
-            if (!myRole) { // 单机模式独有：草稿归档 + 会话分隔 + 单机历史计时
-              if (this.draftRestored) { // 上次草稿归档进历史（PLAN.md §4.6）
-                this._archiveDraft();
+            if (!myRole) { // 单机模式独有：草稿并入本条记录 + 会话分隔 + 单机历史计时
+              if (this.draftRestored) { // 恢复的草稿并入当前屏幕这条历史（不再单独归档成 'd-' 条目）
                 this.draftRestored = false;
                 localStorage.removeItem('listen_draft');
               }
               if (this.finalLines.length) { // 再点开始 = 新会话，旧文保留加分隔（PLAN.md §4.5）
                 this.finalLines.push({ key: 'd-' + Date.now(), type: 'divider', label: fmtClock(new Date()) });
               }
-              sessionId = 's-' + Date.now();
+              if (!sessionId) { // 一屏一记录：同一屏幕（未清空）始终 upsert 同一条，新识别只更新不新增
+                sessionId = 's-' + Date.now();
+                sessionStartAt = Date.now();
+              }
               if (historyTimer) clearInterval(historyTimer);
               historyTimer = setInterval(() => this._upsertSession(), 60000);
             }
+            asrNonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 6); // 新 ASR 会话：转正行 key 换域（防跨会话对账）
             committedKeys = new Set();
             this.state = 'listening';
             listenStartAt = Date.now();
+            lastVoiceAt = Date.now();
+            interimStart = 0;
             this.elapsedSec = 0;
             if (tickTimer) clearInterval(tickTimer);
             tickTimer = setInterval(() => {
               this.elapsedSec = Math.floor((Date.now() - listenStartAt) / 1000);
             }, 1000);
+            if (silenceTimer) clearInterval(silenceTimer);
+            silenceTimer = setInterval(() => this._checkSilencePromote(), 400);
           } catch (e) {
             console.error('[listen] start failed:', e);
             this._setError(this._friendlyError(e));
@@ -1049,12 +1084,14 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           const blobUrl = URL.createObjectURL(new Blob([window.LISTEN_WORKLET_SRC], { type: 'application/javascript' }));
           await audioCtx.audioWorklet.addModule(blobUrl);
           URL.revokeObjectURL(blobUrl);
-          workletNode = new AudioWorkletNode(audioCtx, 'listen-pcm');
-          workletNode.port.onmessage = (e) => this._onAudioChunk(new Uint8Array(e.data.int16));
+              workletNode = new AudioWorkletNode(audioCtx, 'listen-pcm');
+          workletNode.port.onmessage = (e) => this._onAudioChunk(new Uint8Array(e.data.int16), e.data.rms);
           srcNode = audioCtx.createMediaStreamSource(micStream);
           srcNode.connect(workletNode); // 不连 destination，避免回环
         },
-        _onAudioChunk(bytes) {
+        _onAudioChunk(bytes, rms) {
+          // 静音检测：rms 缺省（调试注入）按有声处理——宁可漏转正，不可错杀
+          if (rms == null || rms > VOICE_RMS) lastVoiceAt = Date.now();
           if (this.state !== 'listening' || !ws || ws.readyState !== 1) return; // 重连间隙丢弃
           if (ws.bufferedAmount > 1024 * 1024) { // 1MB：连接劣化，告警丢弃（PLAN.md §4.2）
             console.warn('[listen] 上行拥堵，丢一包 audio（bufferedAmount=' + ws.bufferedAmount + '）');
@@ -1070,6 +1107,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
           if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
           if (historyTimer) { clearInterval(historyTimer); historyTimer = null; }
+          if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
           if (myRole) this._chatUpsertHistory(); // 字聊模式：落字聊历史，不写单机草稿/会话（§11.4）
           else {
             this._upsertSession(); // 收尾统一落一条历史（正常结束/出错/超时都保留已出文字）
@@ -1201,6 +1239,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
         _onNewSession(label) { // 重连/恢复成功 = 新会话：重置去重集合、插分隔行、回 listening
           reconnectAttempts = 0;
+          asrNonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 6); // 换域：旧会话的转正行从此不可被对账（服务端不会再为它们发定稿）
           committedKeys = new Set(); // 新会话时间戳从头计，旧 key 集合必须换新（否则同 key 定稿行会被误丢）
           if (myRole) { // 字聊模式：不插分隔行，历史会话延续
             this.state = 'listening';
@@ -1237,9 +1276,10 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           console.log('[listen] resp seq=' + f.seq + ' flags=' + f.flags.toString(2).padStart(4, '0'), j);
           if (j && j.result) this._applyResult(j.result);
         },
-        _applyResult(result) { // 累积算法 PLAN.md §4.3；字聊模式双消费者（§11.4：喂 chatLines + 发房间）
+        _applyResult(result) { // 累积算法 PLAN.md §4.3 + 静音转正对账（v1.1.2：防双份文本）
           const utts = result.utterances || [];
           let interim = '';
+          const pPrefix = 'p' + asrNonce + '-'; // 本会话转正行 key 前缀
           for (let i = 0; i < utts.length; i++) {
             const u = utts[i];
             if (u.definite) {
@@ -1247,14 +1287,54 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               if (committedKeys && !committedKeys.has(key)) {
                 committedKeys.add(key);
                 if (myRole) {
-                  this.chatLines.push({ id: 'me-' + key, side: 'me', text: u.text });
-                  roomSend({ t: 'line', kind: 'final', key: key, text: u.text });
+                  // 对账：同 start_time 的转正行原位升级为服务端定稿；被 [start,end) 覆盖的转正行删除（服务端合并短句的情况）
+                  let replaced = false;
+                  const drop = [];
+                  const elig = [];
+                  for (let j = this.chatLines.length - 1; j >= 0; j--) {
+                    const l = this.chatLines[j];
+                    if (l.side !== 'me' || !l.k || l.k.indexOf(pPrefix) !== 0) continue;
+                    const ls = Number(l.k.slice(pPrefix.length));
+                    const old = l.k;
+                    if (ls === u.start_time) {
+                      l.k = key; l.text = u.text; replaced = true; drop.unshift(old);
+                    } else if (ls > u.start_time && ls < u.end_time) {
+                      this.chatLines.splice(j, 1); drop.unshift(old);
+                    } else {
+                      elig.unshift(l); // 候选兜底（最近的在前）
+                    }
+                  }
+                  if (!replaced && elig.length === 1 && normSpeech(elig[0].text).length >= 2 &&
+                      normSpeech(u.text).indexOf(normSpeech(elig[0].text)) === 0) {
+                    drop.unshift(elig[0].k); elig[0].k = key; elig[0].text = u.text; replaced = true;
+                  }
+                  if (replaced || drop.length) {
+                    roomSend({ t: 'revise', key: key, text: u.text, drop: drop });
+                  } else {
+                    this.chatLines.push({ id: 'k-' + key, side: 'me', text: u.text, k: key });
+                    roomSend({ t: 'line', kind: 'final', key: key, text: u.text });
+                  }
                 } else {
-                  this.finalLines.push({ key: key, text: u.text });
+                  let replaced = false;
+                  const elig = [];
+                  for (let j = this.finalLines.length - 1; j >= 0; j--) {
+                    const l = this.finalLines[j];
+                    if (!l.key || l.key.indexOf(pPrefix) !== 0) continue;
+                    const ls = Number(l.key.slice(pPrefix.length));
+                    if (ls === u.start_time) { l.key = key; l.text = u.text; replaced = true; }
+                    else if (ls > u.start_time && ls < u.end_time) { this.finalLines.splice(j, 1); }
+                    else { elig.unshift(l); }
+                  }
+                  if (!replaced && elig.length === 1 && normSpeech(elig[0].text).length >= 2 &&
+                      normSpeech(u.text).indexOf(normSpeech(elig[0].text)) === 0) {
+                    elig[0].key = key; elig[0].text = u.text; replaced = true;
+                  }
+                  if (!replaced) this.finalLines.push({ key: key, text: u.text });
                 }
               }
             } else {
               interim = u.text; // 最多一个非 definite，取最后一个
+              if (u.start_time != null) interimStart = u.start_time; // 对账锚点（与定稿同 start_time，实测）
             }
           }
           if (myRole) {
@@ -1265,6 +1345,26 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           } else {
             this.interimText = interim;
           }
+          this._scrollToBottom();
+        },
+
+        // ---------- 静音草稿转正（v1.1.2） ----------
+        _checkSilencePromote() { // 400ms 轮询：静音超阈值且有草稿 → 本地转正
+          if (this.state !== 'listening') return;
+          if (Date.now() - lastVoiceAt < SILENCE_PROMOTE_MS) return;
+          if (myRole ? this.myGhost : this.interimText) this._promoteInterim();
+        },
+        _promoteInterim() { // 草稿先落为定稿（不等服务端）；服务端 definite 到达后 _applyResult 原位对账升级
+          const pk = 'p' + asrNonce + '-' + (interimStart || 0);
+          if (myRole) {
+            this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
+            roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
+            this.myGhost = '';
+          } else {
+            this.finalLines.push({ key: pk, text: this.interimText });
+            this.interimText = '';
+          }
+          interimStart = 0;
           this._scrollToBottom();
         },
 
@@ -1284,7 +1384,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
 
         // ---------- 调试钩子（obscura/DevTools 用，正常流程不经过） ----------
         __debugStart() { this.__debugNoMic = true; return this.startListening(); },
-        __debugFeed(u8) { this._onAudioChunk(u8); },
+        __debugFeed(u8, rms) { this._onAudioChunk(u8, rms); },
         __debugFinish() { return this.stopListening(); },
         __debugSimulateDrop() { // 模拟断网：ws 包有 terminate（Node 测试用）；浏览器无则跳过
           if (ws && ws.terminate) ws.terminate();

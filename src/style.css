@@ -60,6 +60,11 @@ button {
   cursor: pointer;
 }
 
+/* Vue 挂载前隐藏整个模板（防 {{ }} 双花括号闪现；Vue mount 后自动移除该属性） */
+[v-cloak] {
+  display: none !important;
+}
+
 /* ================= 布局骨架（移动优先单列） ================= */
 
 #app {
