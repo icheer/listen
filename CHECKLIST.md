@@ -232,6 +232,7 @@ node src/deploy.js && node test/core-test.mjs && node test/app-e2e.mjs && node t
 - [x] **v1.1.7 续说改写防重复（2026-09-29 真机 bug：一句话转正后不久续说下一句，上一句重新变草稿，最终两句一模一样）**：根因链=① 服务端续说时偶发改写这句早前的文字 → 严格前缀剥离（splitOverlap）失败 → 草稿回退全量（旧句复活成 ghost）→ 静音转正成重复行；② 整句 definite 走非前缀对账时，延续轮次 key（`p<nonce>-<st>-<轮次>`）被 `Number()` 整串解析得 NaN → 同句旧行永远匹配不上、删不掉 → 两句并存。修复三层：草稿剥离改 `stripLcp`（归一化最长公共前缀，改写多少剥多少，ghost 永不回退全量）；定稿非前缀对账解析延续 key 用 `/^(\d+)/` 只取首段数字；`_promoteInterim` 兜底（同句已转正内容完全覆盖草稿时不加行只清草稿）。测试：app-e2e 场景6 第四轮（单机：LCP 剥离/延续行/合并一句）+ 6b 第二轮（字聊：revise 带 双 drop），80/80
 - [x] **v1.1.5 体验三项（2026-09-29 用户提出）**：① 页面不可见（切后台/息屏）持续 5 分钟 → 自动停止听写（计费护栏；字聊只停收音、房间保留；回前台 toast 提示、及时回来取消；`_onVisibility` 方法化便于测试，`__debugSetHiddenStop` 覆盖时长）② 字聊历史/复制：说话人切换处插空行（`chatText`）③ 字号新增 `-2`/`-1` 最小两档 2.6/3.4vh（class `.font--2`/`.font--1`，旧档位语义不变，A- 下限放宽——注意模板 disabled 与 decFont 守卫两端同步改）。测试：app-e2e 场景7（自动停止+取消）+ 场景4 空行断言，68/68
 - [x] **v1.1.8 屏蔽外部字号与手势缩放（2026-09-29 用户提出）**：① `html,body` 加 `-webkit-text-size-adjust:100%; text-size-adjust:100%`——微信内「标准/大/特大」字号与系统字体大小不再放大应用文字（应用内有自己的十二档字号，老的特大档会把布局撑坏）；② viewport meta 加 `maximum-scale=1, user-scalable=no`，禁双击/双指缩放页面。测试：ui-browser 28/28（注入产物含两条 CSS 属性与新 meta 已验证）
+- [x] **v1.1.9 README 全面重写（2026-09-29 用户提出）**：两种模式介绍、特性总览（转写体验/适老化/稳定性与费用护栏/远程字聊/隐私安全）、架构图、三种部署方式（Fork + Cloudflare Git 集成【构建 `npm install && npm run inject` + 部署 `npx wrangler deploy`】/ 本地 wrangler CLI / Dashboard 粘贴+DO 绑定警示）、secrets 必填表 + 可选配置表、费用与边界注意事项
 - [x] 测试：core-test worklet RMS 断言；app-e2e 场景5（一屏一记录）+ 场景6/6b（单机/字聊静音转正+对账，真实 ASR 验证 duck 只出现一次）；room-e2e revise 中继/backlog 修正用例
 
 **验收**：
