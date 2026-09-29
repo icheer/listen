@@ -1238,7 +1238,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         _closeHint(code) { // 关闭码 → 人话提示（PLAN.md §8）
           if (code === 1008) return '会话时间到了，正在自动重新开始';
           if (code === 1013) return '连接数太多，稍后自动重试';
-          if (code === 45000081) return '后台太久断开了，正在重连';
+          if (code === 45000081) return '连接中断了，正在自动重连'; // 等包超时：切后台太久或切网导致上行中断都会走到这
           return null;
         },
         _scheduleReconnect(closeEvent) {
@@ -1288,7 +1288,15 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           const f = ListenProto.parseFrame(data);
           if (f.type === 'error') {
             console.warn('[listen] 协议错误帧 code=' + f.code, f.msg);
-            if (f.code === 45000081) this.toast(this._closeHint(45000081)); // 等包超时：回前台自动重连兜
+            if (f.code === 45000081) {
+              this.toast(this._closeHint(45000081));
+              // 前台收到等包超时（切网导致上行中断等）：服务端已放弃本会话，主动重连——
+              // 不再等服务端 close 事件（半死连接可能永远等不到；后台则维持旧行为，回前台再连）
+              if (this.state === 'listening' && document.visibilityState === 'visible') {
+                this._closeWs();
+                this._scheduleReconnect({ code: 45000081 });
+              }
+            }
             return;
           }
           if (f.type !== 'resp') return;
