@@ -46,6 +46,9 @@
 html,
 body {
   height: 100%;
+  /* 微信「标准/大/特大」字号与系统字体大小不inflate本应用（应用内有自己的十二档字号） */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
