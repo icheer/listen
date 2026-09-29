@@ -226,12 +226,13 @@ node src/deploy.js && node test/core-test.mjs && node test/app-e2e.mjs && node t
   - worklet 每块附带 RMS（`{int16, rms}`）；`rms>300` 记有声；`listening && 有草稿 && 静音≥1500ms` → 本地转正（400ms 轮询 timer）
   - 对账防双份：转正行 key=`p<nonce>-<interimStart>`（nonce 每 ASR 会话轮换）；服务端 definite 同 `start_time` 原位替换、区间覆盖删除、文本前缀兜底
   - 字聊：转正发 `line final`，对账广播 `revise`；DO 存储/对端/backlog 同步原位修正（worker.js ChatRoom 增 revise 处理）
+- [x] **v1.1.3 防复活修复（2026-09-29 真机 bug：一句「你好，能听到我说话吗」重复 3 遍）**：静音期服务端周期性重发同句草稿导致 ghost 反复复活→反复转正。修复：① `_applyResult` 同 start_time 草稿且已转正 → 原位更新行、ghost 不复活；② `_promoteInterim` 同 key 原位更新不加行；③ 定稿对账同 start_time 多条只留一条。测试：app-e2e 场景6 第二轮（重发抑制）+ 6b（字聊同款），59/59
 - [x] 测试：core-test worklet RMS 断言；app-e2e 场景5（一屏一记录）+ 场景6/6b（单机/字聊静音转正+对账，真实 ASR 验证 duck 只出现一次）；room-e2e revise 中继/backlog 修正用例
 
 **验收**：
 ```bash
 node test/core-test.mjs && node test/room-e2e.mjs && node test/app-e2e.mjs && node test/ui-browser-test.mjs
-# 20/20 + 30/30 + 53/53 + 26/26（2026-09-29 全绿）
+# 20/20 + 30/30 + 59/59 + 26/26（2026-09-29 v1.1.3 全绿）
 # 真机手测（待用户）：说话停顿 ~1.5s 草稿即转正变深色；继续说则新草稿另起一行；
 # 停止后无重复句；字聊对端看到气泡先无标点、随后原位更新为带标点终稿
 ```

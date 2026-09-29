@@ -1287,7 +1287,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               if (committedKeys && !committedKeys.has(key)) {
                 committedKeys.add(key);
                 if (myRole) {
-                  // 对账：同 start_time 的转正行原位升级为服务端定稿；被 [start,end) 覆盖的转正行删除（服务端合并短句的情况）
+                  // 对账：同 start_time 的转正行原位升级为服务端定稿（多条只留一条）；被 [start,end) 覆盖的转正行删除
                   let replaced = false;
                   const drop = [];
                   const elig = [];
@@ -1297,7 +1297,8 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                     const ls = Number(l.k.slice(pPrefix.length));
                     const old = l.k;
                     if (ls === u.start_time) {
-                      l.k = key; l.text = u.text; replaced = true; drop.unshift(old);
+                      if (!replaced) { l.k = key; l.text = u.text; replaced = true; drop.unshift(old); }
+                      else { this.chatLines.splice(j, 1); drop.unshift(old); } // 同句多次转正残留：去重
                     } else if (ls > u.start_time && ls < u.end_time) {
                       this.chatLines.splice(j, 1); drop.unshift(old);
                     } else {
@@ -1321,7 +1322,10 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                     const l = this.finalLines[j];
                     if (!l.key || l.key.indexOf(pPrefix) !== 0) continue;
                     const ls = Number(l.key.slice(pPrefix.length));
-                    if (ls === u.start_time) { l.key = key; l.text = u.text; replaced = true; }
+                    if (ls === u.start_time) {
+                      if (!replaced) { l.key = key; l.text = u.text; replaced = true; }
+                      else { this.finalLines.splice(j, 1); } // 同句多次转正残留：去重
+                    }
                     else if (ls > u.start_time && ls < u.end_time) { this.finalLines.splice(j, 1); }
                     else { elig.unshift(l); }
                   }
@@ -1335,6 +1339,16 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             } else {
               interim = u.text; // 最多一个非 definite，取最后一个
               if (u.start_time != null) interimStart = u.start_time; // 对账锚点（与定稿同 start_time，实测）
+              // v1.1.3 防重复：静音期服务端会周期性重发同一句草稿——该句已转正时原位更新、不复活 ghost
+              //（否则静音计时早已超阈，ghost 一复活下一个轮询就再次转正 → 重复行）
+              const pl = this._findPromoted('p' + asrNonce + '-' + (interimStart || 0));
+              if (pl) {
+                if (pl.text !== u.text) {
+                  pl.text = u.text;
+                  if (myRole) roomSend({ t: 'revise', key: 'p' + asrNonce + '-' + (interimStart || 0), text: u.text, drop: [] });
+                }
+                interim = '';
+              }
             }
           }
           if (myRole) {
@@ -1356,16 +1370,33 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
         _promoteInterim() { // 草稿先落为定稿（不等服务端）；服务端 definite 到达后 _applyResult 原位对账升级
           const pk = 'p' + asrNonce + '-' + (interimStart || 0);
+          const hit = this._findPromoted(pk); // 同句再次转正（草稿被服务端重发复活等）：原位更新，不重复加行
           if (myRole) {
-            this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
-            roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
+            if (hit) {
+              if (hit.text !== this.myGhost) {
+                hit.text = this.myGhost;
+                roomSend({ t: 'revise', key: pk, text: this.myGhost, drop: [] });
+              }
+            } else {
+              this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
+              roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
+            }
             this.myGhost = '';
           } else {
-            this.finalLines.push({ key: pk, text: this.interimText });
+            if (hit) hit.text = this.interimText;
+            else this.finalLines.push({ key: pk, text: this.interimText });
             this.interimText = '';
           }
           interimStart = 0;
           this._scrollToBottom();
+        },
+        _findPromoted(pk) { // 找当前会话中 key=pk 的已转正行（单机 finalLines / 字聊 chatLines）
+          const arr = myRole ? this.chatLines : this.finalLines;
+          for (let j = arr.length - 1; j >= 0; j--) {
+            const l = arr[j];
+            if (myRole ? (l.side === 'me' && l.k === pk) : l.key === pk) return l;
+          }
+          return null;
         },
 
         // ---------- 错误 ----------
