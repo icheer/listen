@@ -113,13 +113,24 @@
                 :disabled="state === 'stopping' || state === 'connecting'"
                 @click="toggleListen">{{ mainButtonText }}</button>
         <div class="secondary-row">
-          <button class="btn-sub" :disabled="!finalLines.length && !interimText" @click="clearScreen">清空</button>
-          <button class="btn-sub" :disabled="!fullText" @click="copyAll">复制</button>
+          <button class="btn-sub" :disabled="controlsLocked || (!finalLines.length && !interimText)" @click="clearScreen">清空</button>
+          <button class="btn-sub" :disabled="controlsLocked || !fullText" @click="copyAll">复制</button>
         </div>
       </footer>
 
       <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
     </template>
+
+    <!-- 自绘确认模态框（替代 window.confirm：系统弹窗频繁触发会被微信判骚扰） -->
+    <div v-if="modalOpen" class="modal-mask" @click.self="answerModal(false)">
+      <div class="modal" role="dialog" aria-modal="true">
+        <p class="modal-msg">{{ modalMsg }}</p>
+        <div class="modal-row">
+          <button class="btn-sub" @click="answerModal(false)">取消</button>
+          <button class="btn-main" @click="answerModal(true)">确定</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script src="vendor/vue.global.prod.js"></script>
   <script id="listen-core">
@@ -250,6 +261,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     let sessionId = null;     // 当前会话 id（历史落库用）
     let draftTimer = null;    // 草稿 30s 落盘
     let historyTimer = null;  // listening 期间 60s 历史落库
+    let modalResolve = null;  // 确认模态框的 Promise resolve（_confirm 用）
 
     const SILENCE_100MS = new Uint8Array(3200); // 100ms 静音（16k s16le），尾包兜底用
 
@@ -282,6 +294,8 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           autoScroll: true,      // 用户上滑看历史时暂停自动滚动
           menuOpen: false,
           toastMsg: '',
+          modalOpen: false,     // 确认模态框
+          modalMsg: '',
           isDark: false,
           showPw: false,
           gatePassword: '',
@@ -316,6 +330,9 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             .filter(function (l) { return l.type !== 'divider'; })
             .map(function (l) { return l.text; })
             .join('\n');
+        },
+        controlsLocked() { // 收音过程中锁定清空/复制，防误触造成意外状态
+          return this.state === 'listening' || this.state === 'stopping' || this.state === 'connecting';
         }
       },
       mounted() {
@@ -374,7 +391,10 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
 
         // ---------- 菜单动作 ----------
-        async copyAll() { this.copyText(this.fullText, '已复制'); },
+        async copyAll() {
+          if (this.controlsLocked) return;
+          this.copyText(this.fullText, '已复制');
+        },
         async copyText(text, okMsg) {
           if (!text) return;
           this.menuOpen = false;
@@ -395,8 +415,9 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             this.toast(ok ? '已复制' : '复制失败，请长按文字手动复制');
           }
         },
-        clearScreen() {
-          if (!window.confirm('确定清空当前屏幕的文字吗？')) return;
+        async clearScreen() {
+          if (this.controlsLocked) return;
+          if (!(await this._confirm('确定清空当前屏幕的文字吗？'))) return;
           this.finalLines = [];
           this.interimText = '';
           if (committedKeys) committedKeys = new Set();
@@ -416,6 +437,20 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           this.toastMsg = msg;
           if (toastTimer) clearTimeout(toastTimer);
           toastTimer = setTimeout(() => { this.toastMsg = ''; }, 1800);
+        },
+
+        // ---------- 确认模态框（替代 window.confirm，微信防骚扰） ----------
+        _confirm(message) {
+          return new Promise((resolve) => {
+            modalResolve = resolve;
+            this.modalMsg = message;
+            this.modalOpen = true;
+          });
+        },
+        answerModal(val) {
+          this.modalOpen = false;
+          this.modalMsg = '';
+          if (modalResolve) { modalResolve(val); modalResolve = null; }
         },
 
         // ---------- 持久化：草稿与历史（PLAN.md §4.6） ----------
@@ -485,15 +520,15 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           this.historyDetail = this.history.find(s => s.id === id) || null;
           this.screen = 'historyDetail';
         },
-        deleteHistory(id) {
-          if (!id || !window.confirm('确定删除这条记录吗？')) return;
+        async deleteHistory(id) {
+          if (!id || !(await this._confirm('确定删除这条记录吗？'))) return;
           this._historySave(this._historyLoad().filter(s => s.id !== id));
           this.history = this._historyLoad();
           this.historyDetail = null;
           this.screen = 'history';
         },
-        clearHistory() {
-          if (!window.confirm('确定清空全部历史记录吗？')) return;
+        async clearHistory() {
+          if (!(await this._confirm('确定清空全部历史记录吗？'))) return;
           localStorage.removeItem('listen_sessions');
           this.history = [];
         },

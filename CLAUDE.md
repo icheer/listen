@@ -34,6 +34,7 @@ node scripts/gen-icons.mjs       # 重生成 PWA 图标
 - **注入管线**：`src/deploy.js` 读 `src/app.html` → 内联 style.css → vendor Vue 以占位文本参与压缩后换回**未压缩**脚本块 → html-minifier-terser 压其余 → 转义 `` \ ` $ `` → 写 worker.js 的 `htmlContent` 标记区间。⚠️ `String.replace` 用变量内容做替换必须**函数形式**，否则 `$&` 等模式会静默损坏内容（Phase 0 踩过）。
 - **协议帧**（大端，详见 PLAN.md §2——**以它为准，勿猜**）：配置 `11 10 11 00`（gzip）/`11 10 10 00`（raw）+ u32 长度 + JSON；音频 `11 20 00 00`（尾包 `11 22`）；响应 msgType `0b1001`（flags 含 1 → 后随 seq；`0011`=最终），错误 `0b1111`。响压缩跟随配置帧。
 - **渲染算法**：`finalLines` + `committedKeys`（key=`start_time-end_time`）；重连/新会话必须重置 `committedKeys`（时间戳重新计数）。断线时进行中草稿落成定稿保留。
+- **Vue 3 陷阱**：`_` 前缀的方法不会被代理进模板上下文（`@click="_foo()"` 静默失效），模板只引用不带下划线的方法（如 `answerModal`）；内部 `this._xxx` 不受影响。
 - **obscura 无头浏览器**（本机 `/usr/local/bin`）：渲染验收用；页面级 WebSocket 不联网、localStorage 不跨 reload——WS/持久化链路要用 `test/app-e2e.mjs`（Node 沙箱）验证。
 
 ## 硬约束
