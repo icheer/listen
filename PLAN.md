@@ -320,7 +320,7 @@ onResponse(utterances):
 | `--brand` | `#0E7A5F`（深青绿） | 主按钮/收音状态 |
 | `--danger` | `#C2410C`（暗橙红） | 停止按钮/错误 |
 | `--divider` | `#E7E5E4` / `#2A2E33` | 分隔线/边框 |
-| 字号阶梯 | **vh 十档**（转写区）：4.2 / 5.0 / 5.8 / 6.6 / 7.4 / 8.2 / 9.0 / 9.8 / 10.6 / 11.4vh，默认 8.2vh · 辅助信息（菜单/按钮）13–17px 固定 | |
+| 字号阶梯 | **vh 十一档**（转写区）：3.4 / 4.2 / 5.0 / 5.8 / 6.6 / 7.4 / 8.2 / 9.0 / 9.8 / 10.6 / 11.4vh（`-1` 档 v1.1.5），默认 8.2vh · 辅助信息（菜单/按钮）13–17px 固定 | |
 | 圆角/间距 | 按钮 999px；卡片 12px；页边距 16px | |
 
 - 字体：`system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`。
@@ -361,6 +361,7 @@ onResponse(utterances):
 | 断网/切后台 | WS 断开自动重连（后台时 AudioWorklet 停供 → 45000081，回前台重连）；iOS 后台音频挂起属预期 |
 | 上游 502（凭证/服务问题） | 错误页提示「服务配置错误，联系管理员」，不自动重试 |
 | 用户锁屏/来电 | 页面 visibilitychange → 恢复时检查连接并重连 |
+| 页面后台/息屏 ≥5 分钟（v1.1.5） | **自动停止听写**（计费护栏；字聊模式只停收音、房间保留可重进），回前台 toast 提示，及时回来则取消 |
 | 数据清理 | 「清空屏幕」只清当前显示；历史按条删 |
 
 ## 9. 部署
@@ -452,7 +453,7 @@ node src/deploy.js && npx wrangler deploy
 - **访客端极简**：无密码门、无历史、无 ⚙；保留 A-/A+ 与系统主题跟随；**麦克风拒绝 → 只读模式**（仍可看对方气泡，界面不挡）。
 - **QR**：vendored `qrcode-generator`（MIT，~15KB，构建期内联——deploy.js 的第二个 vendor 占位符，机制与 Vue 相同）；画 canvas → `toDataURL` → `<img>`——**微信长按识别只认 `<img>`，canvas 不触发**。QR 内容 = `${location.origin}/j/${code}`。
 - **引擎复用**：音频/协议/重连引擎不动；把 ASR 定稿/草稿输出抽象为**双消费者**（单机模式喂 `finalLines`，字聊模式喂 `chatLines` + 发房间）。从菜单进入字聊时若正在单机收音，先确认停止。
-- **历史**：字聊会话在 host 侧 60s + pagehide upsert 进 `listen_sessions`（文本行 `我：` / `对方：` 前缀）；访客设备不落任何存储。字聊期间不写 `listen_draft`、不显示草稿横幅。
+- **历史**：字聊会话在 host 侧 60s + pagehide upsert 进 `listen_sessions`（文本行 `我：` / `对方：` 前缀，说话人切换处插空行 v1.1.5）；访客设备不落任何存储。字聊期间不写 `listen_draft`、不显示草稿横幅。
 - **挂断语义**：host「结束」= 关房（双方收 `room_closed` 退回）；guest「退出」= 离开（host 收 presence offline）；host pagehide/断网不立即关房（可重连），DO alarm 兜底。
 
 ### 11.5 边界与降级

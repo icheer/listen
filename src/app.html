@@ -58,7 +58,7 @@
           <p class="app-sub">{{ historyDetail ? fmtHistoryTime(historyDetail.startedAt) : '' }}</p>
         </div>
         <div class="font-ctrl">
-          <button class="icon-btn" :disabled="fontSize <= 0" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
       </header>
@@ -108,7 +108,7 @@
       <header class="app-header">
         <div class="header-title"><h1 class="app-title">远程字聊</h1><p class="app-sub">{{ chatStatusText }}</p></div>
         <div class="font-ctrl">
-          <button class="icon-btn" :disabled="fontSize <= 0" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
       </header>
@@ -150,7 +150,7 @@
           <p class="app-sub">{{ statusText }}</p>
         </div>
         <div class="font-ctrl" aria-label="字号调节">
-          <button class="icon-btn" :disabled="fontSize <= 0" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
         <!-- ⚙ 菜单（收起面板） -->
@@ -355,6 +355,11 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     let silenceTimer = null;    // 400ms 轮询：静音超阈值即本地转正
     let asrNonce = '0';         // 本段 ASR 会话随机串：转正行 key 前缀域，防跨会话 start_time 撞号误对账
 
+    // ----- 后台自动停止（v1.1.5 计费护栏）：页面不可见（切后台/息屏）持续 5 分钟 → 停止听写 -----
+    let hiddenStopTimer = null;
+    let autoStoppedHidden = false;
+    let hiddenStopMs = 5 * 60 * 1000; // 测试可经 __debugSetHiddenStop 覆盖
+
     const SILENCE_100MS = new Uint8Array(3200); // 100ms 静音（16k s16le），尾包兜底用
 
     const CONFIG = {
@@ -406,7 +411,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         return {
           screen: 'main',        // 'gate' | 'main'
           state: 'idle',         // idle/connecting/listening/stopping/error（PLAN.md §4.1）
-          fontSize: 5,           // vh 十档，默认第 5 档 8.2vh（沿用旧版）
+          fontSize: 5,           // vh 十一档（-1..9），默认第 5 档 8.2vh（沿用旧版；-1 为 v1.1.5 新增最小档）
           finalLines: [],        // 定稿行 [{key, text}] 或会话分隔 [{key, type:'divider', label}]
           interimText: '',       // 进行中草稿
           elapsedSec: 0,
@@ -467,11 +472,18 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         controlsLocked() { // 收音过程中锁定清空/复制，防误触造成意外状态
           return this.state === 'listening' || this.state === 'stopping' || this.state === 'connecting';
         },
-        chatText() { // 字聊全文（历史/复制共用，行前缀 我：/对方：）
-          return this.chatLines
-            .filter(function (l) { return l.side !== 'sys'; })
-            .map(function (l) { return (l.side === 'me' ? '我：' : '对方：') + l.text; })
-            .join('\n');
+        chatText() { // 字聊全文（历史/复制共用，行前缀 我：/对方：，说话人切换处插空行更易读）
+          const parts = [];
+          let last = null;
+          const lines = this.chatLines;
+          for (let i = 0; i < lines.length; i++) {
+            const l = lines[i];
+            if (l.side === 'sys') continue;
+            if (last !== null && l.side !== last) parts.push('');
+            parts.push((l.side === 'me' ? '我：' : '对方：') + l.text);
+            last = l.side;
+          }
+          return parts.join('\n');
         },
         chatStatusText() {
           if (this.state === 'listening') return '正在听写';
@@ -483,7 +495,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       },
       mounted() {
         const saved = parseInt(localStorage.getItem('fontSize'), 10);
-        if (saved >= 0 && saved <= 9) this.fontSize = saved;
+        if (saved >= -1 && saved <= 9) this.fontSize = saved; // v1.1.5：新增 -1 最小档（旧存量值语义不变）
         this._applyTheme(this._resolveTheme());
         // 访客路径 /j/<code>：免密码，直接进落地屏（不恢复草稿——访客设备不落任何存储，§11.4）
         const gm = location.pathname.match(/^\/j\/([A-Za-z0-9]{4,16})\/?$/);
@@ -1443,6 +1455,37 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           return out;
         },
 
+        // ---------- 页面可见性（v1.1.5：后台/息屏 5 分钟自动停止，计费护栏） ----------
+        _onVisibility(hidden) {
+          if (hidden) {
+            if (this.state === 'listening') {
+              if (hiddenStopTimer) clearTimeout(hiddenStopTimer);
+              hiddenStopTimer = setTimeout(() => {
+                hiddenStopTimer = null;
+                if (this.state === 'listening') {
+                  autoStoppedHidden = true; // 用户已不在看/说：别再烧 ASR 时长（字聊模式只停收音，房间保留可重进）
+                  console.warn('[listen] 页面后台超过 5 分钟，自动停止听写');
+                  this.stopListening();
+                }
+              }, hiddenStopMs);
+            }
+            return;
+          }
+          if (hiddenStopTimer) { clearTimeout(hiddenStopTimer); hiddenStopTimer = null; } // 及时回来：取消
+          if (autoStoppedHidden) {
+            autoStoppedHidden = false;
+            this.toast('页面在后台太久，已自动停止听写');
+          }
+          if (this.role && (!roomWs || roomWs.readyState !== 1) && !roomUserEnded) {
+            this._openRoomWs(); // 房间 WS 挂起期间死掉：立即重连（backlog 补发定稿）
+          }
+          if (this.state !== 'listening') return;
+          this._acquireWakeLock(); // 常亮锁在后台会被系统回收，回前台重申请
+          if (!ws || ws.readyState !== 1) { // 挂起期间连接已死：跳过剩余退避立即重连
+            this._connectSession().then((ok) => { if (ok) this._onNewSession('恢复'); });
+          }
+        },
+
         // ---------- 错误 ----------
         _friendlyError(e) {
           const name = e && e.name;
@@ -1460,6 +1503,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         // ---------- 调试钩子（obscura/DevTools 用，正常流程不经过） ----------
         __debugStart() { this.__debugNoMic = true; return this.startListening(); },
         __debugFeed(u8, rms) { this._onAudioChunk(u8, rms); },
+        __debugSetHiddenStop(ms) { hiddenStopMs = ms; },
         __debugFinish() { return this.stopListening(); },
         __debugSimulateDrop() { // 模拟断网：ws 包有 terminate（Node 测试用）；浏览器无则跳过
           if (ws && ws.terminate) ws.terminate();
@@ -1492,15 +1536,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
     }
     if (window.addEventListener && document.addEventListener) {
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState !== 'visible') return;
-        if (vm.role && (!roomWs || roomWs.readyState !== 1) && !roomUserEnded) {
-          vm._openRoomWs(); // 房间 WS 挂起期间死掉：立即重连（backlog 补发定稿）
-        }
-        if (vm.state !== 'listening') return;
-        vm._acquireWakeLock(); // 常亮锁在后台会被系统回收，回前台重申请
-        if (!ws || ws.readyState !== 1) { // 挂起期间连接已死：跳过剩余退避立即重连
-          vm._connectSession().then((ok) => { if (ok) vm._onNewSession('恢复'); });
-        }
+        vm._onVisibility(document.visibilityState !== 'visible');
       });
     }
   })();
