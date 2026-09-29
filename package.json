@@ -1,0 +1,15 @@
+{
+  "name": "listen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "听见：给听障人士的实时语音转写（Cloudflare Worker + 火山引擎豆包流式语音识别大模型）。",
+  "scripts": {
+    "inject": "node src/deploy.js",
+    "inject:dev": "node src/deploy.js --no-minify",
+    "dev": "npm run inject && npx wrangler dev",
+    "deploy": "npm run inject && npx wrangler deploy"
+  },
+  "devDependencies": {
+    "html-minifier-terser": "^7.2.0"
+  }
+}

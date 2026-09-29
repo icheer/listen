@@ -1,0 +1,155 @@
+# 听见（listen）实施清单（CHECKLIST）
+
+> 供 Coding Agent 分步实施。规划依据：`PLAN.md`（架构实测结论 §1 / 协议规范 §2 / API §3 / 前端 §4 / 视觉 §5）。
+
+## 执行规则（必须遵守）
+
+1. **按 Phase 顺序执行，不跳批、不合并批**。
+2. **每完成一个 Phase**：先跑该 Phase 的「验收」，全部通过后，把该 Phase 内所有 `- [ ]` 勾选为 `- [x]`，再开始下一个 Phase。验收不通过必须先修复，禁止提前勾选。
+3. 勾选动作 = 直接编辑本文件，把对应任务的 `[ ]` 改为 `[x]`。
+4. 同构参考 `../jev-decides`：`src/deploy.js` 注入管线、worker 骨架、secrets 纪律直接照搬适配；其 Vue 走运行时 CDN（本项目改为 vendored 构建期内联）与 KV 绑定（本项目无）不照搬。UX 与反面教材参考 `../listen-old`（扬弃清单 PLAN.md §4.0）。
+5. 火山引擎凭证在 `API_KEY.txt`（**绝不入库、绝不进 wrangler.toml**，本地调试写 `.dev.vars`）。
+6. 协议帧格式、参数、错误码一律以 `PLAN.md` §2 为准（已实测验证），不要自行猜测字段名。
+7. 前端仅依赖 Vue 3（Options API 写法，vendored 内联），除此外**不引入任何第三方库、不使用运行时 CDN**；音频管线勿照抄 listen-old（坑见 PLAN.md §4.0 弃用清单）。
+
+---
+
+## Phase 0 · 脚手架与注入管线
+
+- [x] 创建 `wrangler.toml`：`name = "listen"`、`main = "worker.js"`、`compatibility_date = "2024-09-01"`（无 KV、无额外绑定；注释里列出全部 secrets 名，见 PLAN.md §3.2）
+- [x] 创建 `.gitignore`：`.dev.vars`、`.wrangler/`、`node_modules/`、`API_KEY.txt`、`test/`
+- [x] 创建 `worker.js` 骨架：模块导出 `fetch`，含 `getHtmlContent()`（`let htmlContent = \`<!doctype html><html><body>PLACEHOLDER</body></html>\`; // htmlContent FINISHED` 标记区间，同 jev-decides）、`GET /` 返回注入 HTML（`Cache-Control: public, max-age=300`）、其余路径 404
+- [x] 创建 `src/app.html`：`<!doctype html>` + 移动 viewport（含 `viewport-fit=cover`）+ `<link rel="stylesheet" href="style.css">` + `<script src="vendor/vue.global.prod.js"></script>` 占位 + 根挂载点 `<div id="app">听见</div>` + Vue3 Options API 空应用（`createApp({data(){...}, methods:{}}).mount('#app')`），页面显示「听见」标题
+- [x] 下载 Vue3 到 `src/vendor/vue.global.prod.js`：`curl -L https://unpkg.com/vue@3.5.22/dist/vue.global.prod.js -o src/vendor/vue.global.prod.js`（与 jev-decides 同版本；校验文件非 404 页，约 130KB）
+- [x] 创建 `src/style.css`：CSS 变量 token（PLAN.md §5 全表：明/暗双色、vh 字号十档 class `.font-0`…`.font-9`、圆角间距）+ reset + 移动优先单列布局（PC ≥768px 居中 `max-width: 720px`）
+- [x] 复制 `../jev-decides/src/deploy.js` 适配为本项目：读 `app.html` → 内联 `style.css` → **内联 `vendor/vue.global.prod.js` 为独立 `<script>` 块（原样嵌入，不经过 terser 压缩，替换掉 `<script src="vendor/...">` 标签）** → 压缩其余 HTML/应用脚本（`html-minifier-terser`，`--no-minify` 跳过）→ 转义 `` \ ` $ `` → 替换 `worker.js` 标记区间
+- [x] 创建 `package.json`（scripts: `inject` / `inject:dev` / `dev` / `deploy`，devDependencies 仅 `html-minifier-terser`）并 `npm install`
+- [x] 创建 `README.md` 占位（Phase 6 补全）
+- [x] 创建 `test/` 目录：放 `PLAN.md` 附录 A 脚本为 `test/proto-test.mjs`（凭证改读环境变量），后续 Phase 2 验收用
+
+**验收**：
+```bash
+node src/deploy.js            # 注入成功、字符统计
+npx wrangler dev              # 本地起服务 http://localhost:8787
+curl -s http://localhost:8787/ | grep -o "听见"          # 命中
+curl -s http://localhost:8787/ | grep -c "vue.global"    # ≥1（Vue 已内联）
+ls -la src/vendor/vue.global.prod.js                     # ~130KB
+git status --porcelain        # API_KEY.txt 被 ignore，不出现在待提交列表
+# 手测：浏览器打开能看到「听见」标题（Vue 挂载成功，无控制台报错）
+```
+
+## Phase 1 · Worker 票据鉴权
+
+- [x] `POST /api/auth`：读 body `{"password":...}`（上限 4KB）与 `ACCESS_PASSWORD` 常量时间比对（`crypto.subtle.timingSafeEqual` 或等长比较）→ 失败 401 `{"error":"密码不对，请重试"}`
+- [x] ticket 签发：`b64url({jti: crypto.randomUUID(), exp: Date.now()+12*3600*1000}) + "." + b64url(HMAC-SHA256(payload, SHA256(ACCESS_PASSWORD + "listen-ticket-v1")))`，返回 `{"ticket", "expiresAt"}`
+- [x] ticket 校验函数 `verifyTicket(ticket)`：split → 重算 HMAC → 比较（时间安全）→ 解 payload → `exp` 检查；任何一步失败返回 null（供 `/ws` 复用）
+- [x] 防爆破：模块级 `Map`（ip → {fails, lockedUntil}），10 次失败锁 15 分钟；IP 取 `CF-Connecting-IP`，缺省用 `x-forwarded-for`
+- [x] `GET /favicon.svg`：内联 SVG（耳朵/声波图形，brand 色）
+- [x] 所有 `/api/*` 响应加 `Cache-Control: no-store`；错误响应统一 `{"error": "人话中文"}`
+- [x] `.dev.vars`：从 `API_KEY.txt` 抄入 `VOLC_APP_ID` / `VOLC_ACCESS_TOKEN`，另设 `ACCESS_PASSWORD=test123`（该文件已 gitignore）
+
+**验收**（`npx wrangler dev` 起着；`.dev.vars` 改动后重启）：
+```bash
+# 正确密码 → 拿到 ticket（三段式 base64url 字符串）
+curl -s -X POST http://localhost:8787/api/auth -H 'Content-Type: application/json' -d '{"password":"test123"}'
+# 错误密码 → 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8787/api/auth -H 'Content-Type: application/json' -d '{"password":"nope"}'
+# 篡改 ticket（改末位字符）→ 无 /ws 可测时先确认 verifyTicket 单元逻辑：篡改后 HMAC 不匹配
+# 防爆破：连打 11 次错误密码 → 第 11 次 429
+for i in $(seq 1 11); do curl -s -o /dev/null -w "%{http_code} " -X POST http://localhost:8787/api/auth -H 'Content-Type: application/json' -d '{"password":"nope"}'; done
+```
+
+## Phase 2 · WebSocket 代理（核心链路）
+
+- [x] `GET /ws?ticket=` 处理：`verifyTicket` 失败 → 401（不升级）；成功取 jti 作 `X-Api-Connect-Id`
+- [x] 出站拨号：`fetch(env.VOLC_ENDPOINT || 'https://openspeech.bytedance.com/api/v3/sauc/bigmodel_async', {headers: {Upgrade:'websocket', 'X-Api-App-Key': env.VOLC_APP_ID, 'X-Api-Access-Key': env.VOLC_ACCESS_TOKEN, 'X-Api-Resource-Id': env.VOLC_RESOURCE_ID || 'volc.bigasr.sauc.duration', 'X-Api-Connect-Id': jti}})`
+- [x] 拨号结果无 `webSocket` → 502 `{"error":"语音服务连接失败"}`（含上游 status 便于排查，注意不回传凭证）
+- [x] `new WebSocketPair()`：客户端侧随 `new Response(null, {status:101, webSocket: client})` 返回；`upstream.webSocket.accept()`；两侧 `message` 事件原样 `send(e.data)`（二进制 ArrayBuffer 直传，禁止 String 化）
+- [x] 双向 close/error 传播（对端 code/reason 透传；error 时 close 对端 1011）
+- [x] 会话时长兜底：连接内闭包记录首条消息时间戳，每条消息检查超 `MAX_SESSION_MINUTES`（默认 120）→ 双向 close(1008)
+- [x] per-ticket 并发上限 2：模块级 `Map`（jti → 活跃数），accept 时 +1、close 时 -1，超限 close(1013)
+
+**验收**（核心里程碑——经本地 worker 全链路真实识别）：
+```bash
+npx wrangler dev &
+# 1. 换票
+TICKET=$(curl -s -X POST http://localhost:8787/api/auth -H 'Content-Type: application/json' -d '{"password":"test123"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).ticket))")
+# 2. 错误票据 → 401
+curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8787/ws?ticket=tampered.sig"
+# 3. 把 test/proto-test.mjs 的连接改为 new WebSocket("ws://localhost:8787/ws?ticket=$TICKET")（Node≥22 原生 WS，或继续用 ws 包）
+#    运行后能看到 seq 递增的识别 JSON、末帧 definite:true、close 1000
+node test/proto-test.mjs
+```
+
+## Phase 3 · 浏览器音频链路（先跑通，后接 UI）
+
+- [x] Vue 应用骨架（Options API）：`data()` 含 `state/screen/ticket/finalLines/interimText/fontSize/...`；WebSocket、AudioContext、worklet、音频缓冲等**重资源放模块级变量**（不进 data，避免响应式代理性能坑）；方法 `connectSession/startListening/stopListening/handleFrame` 等骨架先立好
+- [x] `connectSession()`：POST /api/auth（密码从 localStorage `listen_password`，「记住密码」默认开）→ `new WebSocket("wss://"+location.host+"/ws?ticket="+ticket)`；401 且无保存密码 → 显示密码门
+- [x] 配置帧构造（PLAN.md §2.3 参数、§2.2 帧头 `11 10 11 00`）：JSON → `CompressionStream('gzip')`；不支持时 raw JSON 帧（`11 10 10 00`，记 `configWasGzip`）
+- [x] 麦克风：`getUserMedia`（PLAN.md §4.2 约束集）；权限拒绝 → 引导文案（含微信/iOS/Chrome 路径）；`isSecureContext` 检查
+- [x] AudioWorklet 内联（Blob URL）：Float32 → 降采样 16k（线性插值）→ Int16 → 每 200ms postMessage `{int16: ArrayBuffer}`
+- [x] 主循环：worklet 消息 → 音频帧（`11 20 00 00` + u32 长度 + pcm）→ `ws.send`（bufferedAmount > 1MB 时告警丢弃并标记连接劣化）
+- [x] 响应解析：按 §2.2 解 4 字节头 → msgType 0b1001/0b1111 分支 → 压缩位为 1 时 `DecompressionStream('gzip')` 解压 → `JSON.parse`；本 Phase 仅 `console.log` 增量结果（下个 Phase 接 UI）
+- [x] 停止流程：发尾包（flags 0010，无待发数据时附 100ms 静音）→ 收到 flags 0011 后等服务端 close → 停 worklet、关 AudioContext、停麦克风流**验收**：
+```
+浏览器开 DevTools console，点页面上的临时「开始」调试按钮：
+1. 对手机/电脑说话 → console 持续输出 {type:'resp', payload:{result:{text:'…', utterances:[…]}}}，utterances 的 text 随语音增长
+2. 点「停止」→ 输出末帧 flags=0011 definite=true → WS close 1000
+3. 手机微信内打开（需 HTTPS 或本地局域网调试）→ 麦克风授权正常、同样出字
+4. 断网 5s 再恢复 → 自动重连后继续出字（新会话）
+```
+
+## Phase 4 · 转写主界面
+
+- [x] 状态机（PLAN.md §4.1）：`idle/connecting/listening/stopping/error`；主按钮三态文案内嵌状态与时长：`开始听写` / `● 正在听写（mm:ss）` / `正在结束...`（沿用旧版文案，时长本地计时即可）
+- [x] 布局骨架（PLAN.md §4.5）：全屏滚动转写区 + 底部通栏主按钮（三态：绿/红+呼吸动画/灰禁用）+ 次级「清空」「复制」按钮；左上 ⚙ 菜单、右上浮动 `-`/`+` 字号钮（≥48px 触控）；开始/停止 `navigator.vibrate(50)`
+- [x] 转写渲染：`finalLines` 用 `v-for` + `:key`（definite 去重 key = `start_time-end_time`，算法照抄 PLAN.md §4.3）渲染 `<p>` 列表 + 末尾草稿行（`--text-interim` 灰色）；错误态主按钮变「重试」
+- [x] 自动滚动：新内容滚到底（`$nextTick` 后 `scrollTop = scrollHeight`）；用户上滑取消自动滚，出现「↓ 回到最新」浮标，点按恢复
+- [x] 字号调节：浮动 `-`/`+`，**vh 十档 4.2–11.4vh**（class `.font-0`…`.font-9`，PLAN.md §5），默认 `fontSize=5`（`.font-5` = 8.2vh，沿用旧版默认），localStorage `fontSize` 持久化（沿用旧版键名）
+- [x] ⚙ 菜单：复制全文（`navigator.clipboard`，降级 `execCommand`）、清空屏幕（确认）、退出密码（清 localStorage 票据+密码）；深色模式项 Phase 5 补
+- [x] 密码门屏：大输入框 + 显示/隐藏 + 「记住密码」勾选（默认开）+ 大按钮「进入」；错误信息内联红字
+- [x] 深色模式：`prefers-color-scheme` 自动；系统无偏好时按时段兜底（19:00–7:00 深色，沿用旧版规则）+ 菜单手动切换，localStorage `listen_theme`
+
+**验收**（真机，微信 + Safari/Chrome 各一）：
+```
+1. 中文连续对话 5 分钟：首字 <1.5s（人感），跟字连贯，无断流；草稿字灰显、定稿后变深色
+2. 字号十档切换即时生效且刷新后保持；默认档在 5.5 寸屏一行约 6-8 字可读（老人视角）
+3. 底部主按钮三态正常：开始/正在听写（计秒）/正在结束（禁用）；停止后再开始 → 新会话有分隔线，旧文保留可滚动
+4. 复制全文 → 粘贴完整含定稿文本
+```
+
+## Phase 5 · 适老化与稳定性
+
+- [x] `navigator.wakeLock('screen')`：listening 时申请，`visibilitychange` 回前台重申请，失焦释放重逻辑兜底
+- [x] 自动重连：非正常断开（45000081/网络/1006）→ 指数退避 1s/2s/4s/8s/16s 最多 5 次 → 仍失败显示 error 屏 + 大「重试」按钮；重连成功插入时间分隔行
+- [x] ticket 过期静默续期：/ws 401 → 有保存密码则自动 `/api/auth` 换票重连（全程无感），无密码回密码门
+- [x] 错误文案人话化（映射表）：麦克风拒绝/非 HTTPS/服务配置错误(502)/网络问题/会话超时(1008，提示重开)/并发超限(1013)
+- [x] 会话分隔行样式（小字灰色时间）；`pagehide` 时尽力触发停止流程
+- [x] iOS Safari 真机回归：AudioContext 需用户手势内 resume（开始按钮点击链路里启动）
+
+**验收**（手测清单）：
+```
+□ 开飞行模式 10s 再关 → 5 次退避内自动恢复，已出文字不丢
+□ 收音中锁屏 3 分钟再亮屏 → 仍在收音（wakeLock 生效）
+□ 拒绝麦克风 → 引导文案 + 「重新授权」
+□ 断网超 31s（>5 次退避）→ error 屏 + 重试按钮可用
+□ 真机连续收音 30 分钟无断流、无内存暴涨（DevTools 观察 DOM 行数与 bufferedAmount）
+```
+
+## Phase 6 · 历史 + PWA + 部署收尾
+
+- [x] 刷新恢复（沿用旧版体验，PLAN.md §4.6）：当前文本每 30s + `pagehide` 写 localStorage `listen_draft`（`{text, savedAt}`），重载时恢复显示并顶部标注「上次内容 · 可清空」；点开始新会话后草稿归档进历史
+- [x] 历史落库：停止时存 localStorage `listen_sessions`（`{id, startedAt, endedAt, text}`，上限 50 条 / 2MB 删最旧）；listening 每 60s 与 `pagehide` 时也落（upsert）
+- [x] 历史面板（⚙ 菜单进入）：列表（起止时间 + 首行预览）→ 详情全文 → 复制 / 删除单条 / 清空全部（确认）
+- [x] PWA：`GET /manifest.webmanifest`（name 听见、display standalone、theme/背景色、icons 192/512）+ 图标实现（`src/icons.js` 内嵌 base64 PNG，worker 加两条路由；或项目内生成 PNG 由 deploy.js 注入路由——选一种，勿引外部资源）；`apple-touch-icon` 与 `apple-mobile-web-app-capable` meta
+- [x] `README.md` 补全：产品简介、本地开发（.dev.vars、deploy 注入、wrangler dev）、部署（secrets 三条 + 自定义域名建议 + 冒烟步骤）
+- [x] 创建 `CLAUDE.md`：项目概述、进度区（Phase 勾选状态同步规则）、开发命令、架构摘要（注入管线 / 票据 / WS 代理 / 协议帧速查）、硬约束（凭证纪律 / Vue vendored 内联无运行时 CDN / 协议以 PLAN.md §2 为准）
+- [ ] 线上部署：三条 `wrangler secret put`（正式密码 + API_KEY.txt 凭证）→ `npm run deploy` → 绑定自定义域名（避免 workers.dev 大陆可达性问题）
+- [ ] 线上全量回归：真机（微信 + Safari + Chrome）按 Phase 4/5 验收单重跑核心项
+
+**验收**：
+```bash
+curl -s https://<域名>/manifest.webmanifest | head -3      # JSON 正常
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<域名>/api/auth -H 'Content-Type: application/json' -d '{"password":"错误"}'   # 401
+# 真机：完整走一遍 开始→对话→停止→历史可见→复制；添加到主屏幕后图标/全屏正常
+```

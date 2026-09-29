@@ -1,0 +1,12 @@
+# 凭证与本地密钥（绝不入库）
+API_KEY.txt
+.dev.vars
+
+# wrangler
+.wrangler/
+
+# node
+node_modules/
+
+# 本地测试脚本与测试音频
+test/

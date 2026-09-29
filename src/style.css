@@ -1,0 +1,396 @@
+/* 听见 — 设计 token 与基础布局（PLAN.md §5）
+   移动优先单列；PC ≥768px 居中 720px。
+   主题：JS 设 <html data-theme="light|dark">（系统偏好优先、无偏好按时段兜底、可手动切换）。 */
+
+/* ================= token ================= */
+
+:root {
+  --surface: #ffffff;        /* 背景 */
+  --text-main: #0f172a;      /* 定稿文字（对 surface ≥7:1） */
+  --text-interim: #8a929e;   /* 草稿文字 */
+  --brand: #0e7a5f;          /* 主按钮 / 收音状态 */
+  --danger: #c2410c;         /* 停止按钮 / 错误 */
+  --divider: #e7e5e4;        /* 分隔线 / 边框 */
+
+  --radius-btn: 999px;
+  --radius-card: 12px;
+  --page-margin: 16px;
+
+  --font-sans: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* 深色：手动（data-theme）或系统偏好（未手动指定时） */
+:root[data-theme="dark"] {
+  --surface: #121417;
+  --text-main: #f1f5f9;
+  --text-interim: #98a1ac;
+  --divider: #2a2e33;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --surface: #121417;
+    --text-main: #f1f5f9;
+    --text-interim: #98a1ac;
+    --divider: #2a2e33;
+  }
+}
+
+/* ================= reset ================= */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--surface);
+  color: var(--text-main);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* ================= 布局骨架（移动优先单列） ================= */
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh; /* 移动端地址栏收展时用动态视口 */
+  max-width: 720px;
+  margin: 0 auto; /* PC 上居中 */
+  position: relative;
+}
+
+/* ---------- 顶栏：左 ⚙ · 中标题 · 右 A-/A+ ---------- */
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(var(--page-margin) + env(safe-area-inset-top)) var(--page-margin) var(--page-margin);
+  border-bottom: 1px solid var(--divider);
+  position: relative;
+}
+
+.header-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-title {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.app-sub {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--text-interim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.icon-btn {
+  min-width: 48px; /* 触控 ≥48px（PLAN.md §4.4） */
+  min-height: 48px;
+  font-size: 18px;
+  border: none;
+  border-radius: var(--radius-btn);
+  background: transparent;
+  color: var(--text-main);
+}
+
+.icon-btn:disabled {
+  opacity: 0.35;
+}
+
+/* ⚙ 菜单（收起面板） */
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: var(--page-margin);
+  z-index: 30;
+  min-width: 180px;
+  padding: 6px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+}
+
+.menu button {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  padding: 0 14px;
+  text-align: left;
+  font-size: 16px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-main);
+}
+
+.menu button:active {
+  background: var(--divider);
+}
+
+/* ---------- 转写区 ---------- */
+
+.transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--page-margin);
+  line-height: 1.35; /* 随字号档位缩放 */
+  position: relative;
+}
+
+.transcript .hint {
+  color: var(--text-interim);
+}
+
+.transcript .final {
+  color: var(--text-main);
+  font-weight: 600;
+}
+
+.transcript .interim {
+  color: var(--text-interim);
+}
+
+.session-divider {
+  color: var(--text-interim);
+  font-size: 13px;
+  margin: 12px 0;
+  text-align: center;
+}
+
+/* ↓ 回到最新 浮标 */
+.jump-btn {
+  position: sticky;
+  bottom: 12px;
+  display: block;
+  margin-left: auto;
+  min-height: 44px;
+  padding: 0 18px;
+  font-size: 14px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-btn);
+  background: var(--surface);
+  color: var(--brand);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.16);
+}
+
+/* ---------- 底部控制区：通栏主按钮 + 次级行 ---------- */
+
+.controls {
+  padding: var(--page-margin) var(--page-margin)
+    calc(var(--page-margin) + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.btn-main {
+  width: 100%;
+  min-height: 56px;
+  font-size: 18px;
+  font-weight: 600;
+  border: none;
+  border-radius: var(--radius-btn);
+  background: var(--brand);
+  color: #ffffff;
+}
+
+.btn-main:disabled {
+  opacity: 0.6;
+}
+
+.btn-listening {
+  background: var(--danger);
+  animation: breathe 1.6s ease-in-out infinite; /* 收音中呼吸，弱视可感知（PLAN.md §5） */
+}
+
+.btn-connecting,
+.btn-stopping {
+  background: var(--text-interim);
+}
+
+.btn-error {
+  background: var(--danger);
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.72; }
+}
+
+.secondary-row {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-sub {
+  flex: 1;
+  min-height: 48px;
+  font-size: 16px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-btn);
+  background: var(--surface);
+  color: var(--text-main);
+}
+
+.btn-sub:disabled {
+  opacity: 0.4;
+}
+
+/* ---------- toast ---------- */
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 140px;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 10px 20px;
+  font-size: 15px;
+  border-radius: var(--radius-btn);
+  background: rgba(15, 23, 42, 0.86);
+  color: #ffffff;
+  pointer-events: none;
+}
+
+/* ================= 密码门 ================= */
+
+.gate {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: calc(48px + env(safe-area-inset-top)) var(--page-margin);
+  max-width: 420px;
+  margin: 0 auto;
+  min-height: 100dvh;
+}
+
+.gate-title {
+  font-size: 32px;
+  font-weight: 700;
+}
+
+.gate-sub {
+  font-size: 15px;
+  color: var(--text-interim);
+  margin-bottom: 16px;
+}
+
+.gate-pw {
+  display: flex;
+  gap: 8px;
+}
+
+.gate-pw input {
+  flex: 1;
+  min-width: 0;
+  font-size: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  color: var(--text-main);
+}
+
+.gate-eye {
+  min-width: 48px;
+  min-height: 48px;
+  font-size: 14px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  color: var(--text-main);
+}
+
+.gate-remember {
+  font-size: 15px;
+  color: var(--text-interim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gate-error {
+  color: var(--danger);
+  font-size: 14px;
+}
+
+.gate .btn-main {
+  margin-top: 8px;
+}
+
+/* ---------- 历史面板 ---------- */
+
+.screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--page-margin);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  padding: 14px 16px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  color: var(--text-main);
+}
+
+.history-meta {
+  font-size: 13px;
+  color: var(--text-interim);
+}
+
+.history-preview {
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* ================= vh 十档字号（沿用旧版刻度，PLAN.md §5） ================= */
+
+.font-0  { font-size: 4.2vh; }
+.font-1  { font-size: 5.0vh; }
+.font-2  { font-size: 5.8vh; }
+.font-3  { font-size: 6.6vh; }
+.font-4  { font-size: 7.4vh; }
+.font-5  { font-size: 8.2vh; }  /* 默认档 */
+.font-6  { font-size: 9.0vh; }
+.font-7  { font-size: 9.8vh; }
+.font-8  { font-size: 10.6vh; }
+.font-9  { font-size: 11.4vh; }
