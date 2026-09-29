@@ -400,6 +400,22 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       return full.slice(i).replace(/^[\s，。、！？,.!?：；;:"“”‘’']+/, '');
     }
 
+    // 草稿剥离已转正内容的宽松版（v1.1.7 真机 bug：转正后不久续说，上一句重新变草稿、
+    // 最终两句一模一样）：续说时服务端偶尔会改写这句早前的文字，严格前缀匹配失败 →
+    // splitOverlap 返回 null → 草稿回退全量（旧句复活）→ 转正出重复行。
+    // 这里取归一化最长公共前缀，改写多少剥多少，ghost 只显示真正新增的尾部；恒返回字符串。
+    function stripLcp(full, done) {
+      const nf = normSpeech(full), nd = normSpeech(done);
+      if (!nd || !nf) return String(full || '');
+      let lcp = 0;
+      while (lcp < nf.length && lcp < nd.length && nf.charAt(lcp) === nd.charAt(lcp)) lcp++;
+      let count = 0, i = 0;
+      for (; i < full.length && count < lcp; i++) {
+        if (normSpeech(full.charAt(i))) count++;
+      }
+      return full.slice(i).replace(/^[\s，。、！？,.!?：；;:"“”‘’']+/, '');
+    }
+
     function fmtClock(d) {
       const h = String(d.getHours()).padStart(2, '0');
       const m = String(d.getMinutes()).padStart(2, '0');
@@ -1353,7 +1369,10 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                   for (let j = this.chatLines.length - 1; j >= 0; j--) {
                     const l = this.chatLines[j];
                     if (l.side !== 'me' || !l.k || l.k.indexOf(pPrefix) !== 0) continue;
-                    const ls = Number(l.k.slice(pPrefix.length));
+                    // v1.1.7：延续轮次 key「<st>-<轮次>」只取首段数字——Number() 整串解析得 NaN，
+                    // 导致整句定稿合并时延续行永远匹配不上（删不掉 → 两句并存，真机重复行 bug）
+                    const lsM = /^(\d+)/.exec(l.k.slice(pPrefix.length));
+                    const ls = lsM ? Number(lsM[1]) : NaN;
                     const old = l.k;
                     if (ls === u.start_time) {
                       if (!replaced) { l.k = key; l.text = u.text; replaced = true; drop.unshift(old); }
@@ -1380,7 +1399,8 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                   for (let j = this.finalLines.length - 1; j >= 0; j--) {
                     const l = this.finalLines[j];
                     if (!l.key || l.key.indexOf(pPrefix) !== 0) continue;
-                    const ls = Number(l.key.slice(pPrefix.length));
+                    const lsM = /^(\d+)/.exec(l.key.slice(pPrefix.length)); // v1.1.7：延续 key 只取首段数字（防 NaN）
+                    const ls = lsM ? Number(lsM[1]) : NaN;
                     if (ls === u.start_time) {
                       if (!replaced) { l.key = key; l.text = u.text; replaced = true; }
                       else { this.finalLines.splice(j, 1); }
@@ -1400,12 +1420,13 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               if (u.start_time != null) interimStart = u.start_time; // 对账锚点（与定稿同 start_time，实测）
               // v1.1.4：同句已转正后的草稿（静音期重发 / 续说同句）→ 剥离已转正前缀，
               // ghost 只显示新增部分（旧行不动，新内容从底部开始长）；纯重发 → ghost 空
-              //（防复活：否则静音计时早已超阈，一复活立刻再次转正 → 重复行）
+              //（防复活：否则静音计时早已超阈，一复活立刻再次转正 → 重复行）。
+              // v1.1.7：剥离改用 LCP 宽松匹配——服务端续说时偶发改写早前文字，严格前缀
+              // 会失败回退全量（上一句复活成草稿 → 转正出重复行）
               const plines = this._promotedLinesFor(interimStart || 0);
               if (plines.length) {
                 const done2 = plines.map(function (l) { return l.text; }).join('');
-                const rest2 = splitOverlap(u.text, done2);
-                interim = rest2 !== null ? rest2 : u.text; // null=整句被改写（罕见）：全量显示，定稿对账修正
+                interim = stripLcp(u.text, done2);
               }
             }
           }
@@ -1429,14 +1450,24 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         },
         _promoteInterim() { // 草稿先落为定稿（不等服务端）；服务端 definite 到达后 _applyResult 对账
           let pk = 'p' + asrNonce + '-' + (interimStart || 0);
+          const text = myRole ? this.myGhost : this.interimText;
+          // v1.1.7 兜底：同句已转正内容已完全覆盖草稿（剥离失效的另一道保险）→ 不加行只清草稿，
+          // 防重复行（同句内重复显示已转正内容没有意义；真正的重复说话必然是新 start_time 新句）
+          const pl0 = this._promotedLinesFor(interimStart || 0);
+          const done0 = pl0.map(function (l) { return l.text; }).join('');
+          if (done0 && normSpeech(text) && normSpeech(done0).indexOf(normSpeech(text)) === 0) {
+            if (myRole) this.myGhost = ''; else this.interimText = '';
+            interimStart = 0;
+            return;
+          }
           // v1.1.4：同句延续轮次（转正后继续说同句）→ 新行新 key（旧行不动，前缀剥离见 _applyResult）
           if (this._findPromoted(pk)) pk = pk + '-' + Date.now().toString(36);
           if (myRole) {
-            this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
-            roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
+            this.chatLines.push({ id: 'k-' + pk, side: 'me', text: text, k: pk });
+            roomSend({ t: 'line', kind: 'final', key: pk, text: text });
             this.myGhost = '';
           } else {
-            this.finalLines.push({ key: pk, text: this.interimText });
+            this.finalLines.push({ key: pk, text: text });
             this.interimText = '';
           }
           interimStart = 0;
