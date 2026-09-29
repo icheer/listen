@@ -557,9 +557,10 @@ button {
   color: var(--danger);
 }
 
-/* ================= vh 字号阶梯（PLAN.md §5）：-1..9 共十一档，默认 5 ================= */
+/* ================= vh 字号阶梯（PLAN.md §5）：-2..9 共十二档，默认 5 ================= */
 
-.font--1 { font-size: 3.4vh; } /* v1.1.5 新增最小档：视力正常用户用 */
+.font--2 { font-size: 2.6vh; } /* v1.1.5 新增：视力正常用户用 */
+.font--1 { font-size: 3.4vh; }
 .font-0  { font-size: 4.2vh; }
 .font-1  { font-size: 5.0vh; }
 .font-2  { font-size: 5.8vh; }

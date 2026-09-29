@@ -58,7 +58,7 @@
           <p class="app-sub">{{ historyDetail ? fmtHistoryTime(historyDetail.startedAt) : '' }}</p>
         </div>
         <div class="font-ctrl">
-          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -2" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
       </header>
@@ -108,7 +108,7 @@
       <header class="app-header">
         <div class="header-title"><h1 class="app-title">远程字聊</h1><p class="app-sub">{{ chatStatusText }}</p></div>
         <div class="font-ctrl">
-          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -2" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
       </header>
@@ -150,7 +150,7 @@
           <p class="app-sub">{{ statusText }}</p>
         </div>
         <div class="font-ctrl" aria-label="字号调节">
-          <button class="icon-btn" :disabled="fontSize <= -1" aria-label="减小字号" @click="decFont">A-</button>
+          <button class="icon-btn" :disabled="fontSize <= -2" aria-label="减小字号" @click="decFont">A-</button>
           <button class="icon-btn" :disabled="fontSize >= 9" aria-label="增大字号" @click="incFont">A+</button>
         </div>
         <!-- ⚙ 菜单（收起面板） -->
@@ -411,7 +411,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
         return {
           screen: 'main',        // 'gate' | 'main'
           state: 'idle',         // idle/connecting/listening/stopping/error（PLAN.md §4.1）
-          fontSize: 5,           // vh 十一档（-1..9），默认第 5 档 8.2vh（沿用旧版；-1 为 v1.1.5 新增最小档）
+          fontSize: 5,           // vh 十二档（-2..9），默认第 5 档 8.2vh（沿用旧版；-2/-1 为 v1.1.5 新增最小两档）
           finalLines: [],        // 定稿行 [{key, text}] 或会话分隔 [{key, type:'divider', label}]
           interimText: '',       // 进行中草稿
           elapsedSec: 0,
@@ -495,7 +495,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       },
       mounted() {
         const saved = parseInt(localStorage.getItem('fontSize'), 10);
-        if (saved >= -1 && saved <= 9) this.fontSize = saved; // v1.1.5：新增 -1 最小档（旧存量值语义不变）
+        if (saved >= -2 && saved <= 9) this.fontSize = saved; // v1.1.5：新增 -1 最小档（旧存量值语义不变）
         this._applyTheme(this._resolveTheme());
         // 访客路径 /j/<code>：免密码，直接进落地屏（不恢复草稿——访客设备不落任何存储，§11.4）
         const gm = location.pathname.match(/^\/j\/([A-Za-z0-9]{4,16})\/?$/);
@@ -526,7 +526,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       },
       methods: {
         // ---------- 字号 ----------
-        decFont() { if (this.fontSize > -1) this.setFontSize(this.fontSize - 1); },
+        decFont() { if (this.fontSize > -2) this.setFontSize(this.fontSize - 1); },
         incFont() { if (this.fontSize < 9) this.setFontSize(this.fontSize + 1); },
         setFontSize(n) {
           this.fontSize = n;
