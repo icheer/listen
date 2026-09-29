@@ -382,6 +382,19 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
       return String(s || '').replace(/[\s，。、！？,.!?：；;:"“”‘’']/g, '');
     }
 
+    // 服务端整句文本剥离已转正前缀（v1.1.4 拆行语义）：归一化前缀匹配 → 返回原始串的
+    // 剩余部分（保留内部标点、去行首分隔标点）；非前缀（整句被改写）返回 null。
+    // 场景：静音转正后继续说同句——服务端仍视作同一句（同 start_time），草稿=旂文本+新词。
+    function splitOverlap(full, done) {
+      const nf = normSpeech(full), nd = normSpeech(done);
+      if (!nd || !nf || nf.length < nd.length || nf.slice(0, nd.length) !== nd) return null;
+      let count = 0, i = 0;
+      for (; i < full.length && count < nd.length; i++) {
+        if (normSpeech(full.charAt(i))) count++;
+      }
+      return full.slice(i).replace(/^[\s，。、！？,.!?：；;:"“”‘’']+/, '');
+    }
+
     function fmtClock(d) {
       const h = String(d.getHours()).padStart(2, '0');
       const m = String(d.getMinutes()).padStart(2, '0');
@@ -1276,7 +1289,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           console.log('[listen] resp seq=' + f.seq + ' flags=' + f.flags.toString(2).padStart(4, '0'), j);
           if (j && j.result) this._applyResult(j.result);
         },
-        _applyResult(result) { // 累积算法 PLAN.md §4.3 + 静音转正对账（v1.1.2：防双份文本）
+        _applyResult(result) { // 累积算法 PLAN.md §4.3 + 静音转正对账（v1.1.2 防双份；v1.1.4 拆行）
           const utts = result.utterances || [];
           let interim = '';
           const pPrefix = 'p' + asrNonce + '-'; // 本会话转正行 key 前缀
@@ -1286,8 +1299,34 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
               const key = u.start_time + '-' + u.end_time;
               if (committedKeys && !committedKeys.has(key)) {
                 committedKeys.add(key);
-                if (myRole) {
-                  // 对账：同 start_time 的转正行原位升级为服务端定稿（多条只留一条）；被 [start,end) 覆盖的转正行删除
+                // v1.1.4 拆行语义（真机反馈：续说不应改写旧行）：定稿是本句已转正文本的
+                // 前缀延续 → 旧行全部保持不动，剩余部分作为新行；唯一行且无剩余 = 整句定稿
+                // 只补了标点 → 该行原位升级为带标点终稿。
+                const plines = this._promotedLinesFor(u.start_time);
+                const done = plines.map(function (l) { return l.text; }).join('');
+                const so = done ? splitOverlap(u.text, done) : null;
+                if (so !== null) {
+                  if (so === '') {
+                    if (plines.length === 1) {
+                      const old = plines[0];
+                      const oldK = myRole ? old.k : old.key;
+                      if (myRole) {
+                        old.k = key; old.text = u.text;
+                        roomSend({ t: 'revise', key: key, text: u.text, drop: [oldK] });
+                      } else {
+                        old.key = key; old.text = u.text;
+                      }
+                    }
+                    // 多行且无剩余：各行文本已正确，不加不改（首段无标点是拆行的已知代价）
+                  } else if (myRole) {
+                    this.chatLines.push({ id: 'k-' + key, side: 'me', text: so, k: key });
+                    roomSend({ t: 'line', kind: 'final', key: key, text: so });
+                  } else {
+                    this.finalLines.push({ key: key, text: so });
+                  }
+                } else if (myRole) {
+                  // 非前缀（服务端重写整句，罕见）：原位对账——同 start_time 替换首行并去重，
+                  // [start,end) 覆盖的转正行删除（合并短句），文本前缀兜底
                   let replaced = false;
                   const drop = [];
                   const elig = [];
@@ -1298,11 +1337,11 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                     const old = l.k;
                     if (ls === u.start_time) {
                       if (!replaced) { l.k = key; l.text = u.text; replaced = true; drop.unshift(old); }
-                      else { this.chatLines.splice(j, 1); drop.unshift(old); } // 同句多次转正残留：去重
+                      else { this.chatLines.splice(j, 1); drop.unshift(old); }
                     } else if (ls > u.start_time && ls < u.end_time) {
                       this.chatLines.splice(j, 1); drop.unshift(old);
                     } else {
-                      elig.unshift(l); // 候选兜底（最近的在前）
+                      elig.unshift(l);
                     }
                   }
                   if (!replaced && elig.length === 1 && normSpeech(elig[0].text).length >= 2 &&
@@ -1324,7 +1363,7 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
                     const ls = Number(l.key.slice(pPrefix.length));
                     if (ls === u.start_time) {
                       if (!replaced) { l.key = key; l.text = u.text; replaced = true; }
-                      else { this.finalLines.splice(j, 1); } // 同句多次转正残留：去重
+                      else { this.finalLines.splice(j, 1); }
                     }
                     else if (ls > u.start_time && ls < u.end_time) { this.finalLines.splice(j, 1); }
                     else { elig.unshift(l); }
@@ -1339,25 +1378,25 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             } else {
               interim = u.text; // 最多一个非 definite，取最后一个
               if (u.start_time != null) interimStart = u.start_time; // 对账锚点（与定稿同 start_time，实测）
-              // v1.1.3 防重复：静音期服务端会周期性重发同一句草稿——该句已转正时原位更新、不复活 ghost
-              //（否则静音计时早已超阈，ghost 一复活下一个轮询就再次转正 → 重复行）
-              const pl = this._findPromoted('p' + asrNonce + '-' + (interimStart || 0));
-              if (pl) {
-                if (pl.text !== u.text) {
-                  pl.text = u.text;
-                  if (myRole) roomSend({ t: 'revise', key: 'p' + asrNonce + '-' + (interimStart || 0), text: u.text, drop: [] });
-                }
-                interim = '';
+              // v1.1.4：同句已转正后的草稿（静音期重发 / 续说同句）→ 剥离已转正前缀，
+              // ghost 只显示新增部分（旧行不动，新内容从底部开始长）；纯重发 → ghost 空
+              //（防复活：否则静音计时早已超阈，一复活立刻再次转正 → 重复行）
+              const plines = this._promotedLinesFor(interimStart || 0);
+              if (plines.length) {
+                const done2 = plines.map(function (l) { return l.text; }).join('');
+                const rest2 = splitOverlap(u.text, done2);
+                interim = rest2 !== null ? rest2 : u.text; // null=整句被改写（罕见）：全量显示，定稿对账修正
               }
             }
           }
           if (myRole) {
-            if (this.myGhost !== interim) { // 草稿有变才发（节流）
+            // utts 为空的响应（如配置 ACK/心跳）=「无新信息」≠「草稿消失」（single 模式），不动 ghost
+            if (utts.length && this.myGhost !== interim) { // 草稿有变才发（节流）
               this.myGhost = interim;
               roomSend({ t: 'line', kind: 'interim', key: '', text: interim });
             }
           } else {
-            this.interimText = interim;
+            if (utts.length) this.interimText = interim;
           }
           this._scrollToBottom();
         },
@@ -1368,23 +1407,16 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
           if (Date.now() - lastVoiceAt < SILENCE_PROMOTE_MS) return;
           if (myRole ? this.myGhost : this.interimText) this._promoteInterim();
         },
-        _promoteInterim() { // 草稿先落为定稿（不等服务端）；服务端 definite 到达后 _applyResult 原位对账升级
-          const pk = 'p' + asrNonce + '-' + (interimStart || 0);
-          const hit = this._findPromoted(pk); // 同句再次转正（草稿被服务端重发复活等）：原位更新，不重复加行
+        _promoteInterim() { // 草稿先落为定稿（不等服务端）；服务端 definite 到达后 _applyResult 对账
+          let pk = 'p' + asrNonce + '-' + (interimStart || 0);
+          // v1.1.4：同句延续轮次（转正后继续说同句）→ 新行新 key（旧行不动，前缀剥离见 _applyResult）
+          if (this._findPromoted(pk)) pk = pk + '-' + Date.now().toString(36);
           if (myRole) {
-            if (hit) {
-              if (hit.text !== this.myGhost) {
-                hit.text = this.myGhost;
-                roomSend({ t: 'revise', key: pk, text: this.myGhost, drop: [] });
-              }
-            } else {
-              this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
-              roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
-            }
+            this.chatLines.push({ id: 'k-' + pk, side: 'me', text: this.myGhost, k: pk });
+            roomSend({ t: 'line', kind: 'final', key: pk, text: this.myGhost });
             this.myGhost = '';
           } else {
-            if (hit) hit.text = this.interimText;
-            else this.finalLines.push({ key: pk, text: this.interimText });
+            this.finalLines.push({ key: pk, text: this.interimText });
             this.interimText = '';
           }
           interimStart = 0;
@@ -1397,6 +1429,18 @@ registerProcessor('listen-pcm', ListenPcmProcessor);
             if (myRole ? (l.side === 'me' && l.k === pk) : l.key === pk) return l;
           }
           return null;
+        },
+        _promotedLinesFor(st) { // 该 start_time 的全部已转正行（含延续轮次，按行序）——前缀剥离/对账用
+          const pref = 'p' + asrNonce + '-' + st;
+          const arr = myRole ? this.chatLines : this.finalLines;
+          const out = [];
+          for (let j = 0; j < arr.length; j++) {
+            const l = arr[j];
+            const k = myRole ? l.k : l.key;
+            if (!k) continue; // 系统消息等无 key 行
+            if (k === pref || k.indexOf(pref + '-') === 0) out.push(l);
+          }
+          return out;
         },
 
         // ---------- 错误 ----------
