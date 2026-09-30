@@ -165,7 +165,7 @@ button {
   position: relative;
 }
 
-.transcript .hint {
+.hint { /* 空态提示（转写区/字聊区/历史面板），一律草稿灰 */
   color: var(--text-interim);
 }
 

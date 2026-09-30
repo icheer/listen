@@ -233,6 +233,7 @@ node src/deploy.js && node test/core-test.mjs && node test/app-e2e.mjs && node t
 - [x] **v1.1.5 体验三项（2026-09-29 用户提出）**：① 页面不可见（切后台/息屏）持续 5 分钟 → 自动停止听写（计费护栏；字聊只停收音、房间保留；回前台 toast 提示、及时回来取消；`_onVisibility` 方法化便于测试，`__debugSetHiddenStop` 覆盖时长）② 字聊历史/复制：说话人切换处插空行（`chatText`）③ 字号新增 `-2`/`-1` 最小两档 2.6/3.4vh（class `.font--2`/`.font--1`，旧档位语义不变，A- 下限放宽——注意模板 disabled 与 decFont 守卫两端同步改）。测试：app-e2e 场景7（自动停止+取消）+ 场景4 空行断言，68/68
 - [x] **v1.1.8 屏蔽外部字号与手势缩放（2026-09-29 用户提出）**：① `html,body` 加 `-webkit-text-size-adjust:100%; text-size-adjust:100%`——微信内「标准/大/特大」字号与系统字体大小不再放大应用文字（应用内有自己的十二档字号，老的特大档会把布局撑坏）；② viewport meta 加 `maximum-scale=1, user-scalable=no`，禁双击/双指缩放页面。测试：ui-browser 28/28（注入产物含两条 CSS 属性与新 meta 已验证）
 - [x] **v1.1.9 README 全面重写（2026-09-29 用户提出）**：两种模式介绍、特性总览（转写体验/适老化/稳定性与费用护栏/远程字聊/隐私安全）、架构图、三种部署方式（Fork + Cloudflare Git 集成【构建 `npm install && npm run inject` + 部署 `npx wrangler deploy`】/ 本地 wrangler CLI / Dashboard 粘贴+DO 绑定警示）、secrets 必填表 + 可选配置表、费用与边界注意事项
+- [x] **v1.1.10 字聊空态提示灰色（2026-09-30 用户提出：访客加入后「点下方按钮开始听写」是黑色）**：`.hint` 灰色规则原先只作用于 `.transcript`，聊天屏 `.chat` 内的 hint 继承到正文主色——改为全局 `.hint { color: var(--text-interim) }`（转写区/字聊区/历史面板三处空态统一草稿灰，明暗主题自适应）——ui 28/28
 - [x] 测试：core-test worklet RMS 断言；app-e2e 场景5（一屏一记录）+ 场景6/6b（单机/字聊静音转正+对账，真实 ASR 验证 duck 只出现一次）；room-e2e revise 中继/backlog 修正用例
 
 **验收**：
